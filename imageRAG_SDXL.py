@@ -6,13 +6,70 @@ import openai
 import torch
 from diffusers import AutoPipelineForText2Image, DiffusionPipeline
 from transformers import CLIPVisionModelWithProjection
+import base64
+import io
 
 from utils import *
 from retrieval import *
 
+# 辅助函数：将图片编码为Base64
+def encode_image_to_base64(image_path):
+    """Encodes an image file to a Base64 string."""
+    with Image.open(image_path) as img:
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_byte = buffered.getvalue()
+        return base64.b64encode(img_byte).decode('utf-8')
+
+# 通用的文本/视觉生成函数
+def generate_caption_or_rephrase(client, model_name, prompt, image_paths=[], only_rephrase=False, decision=True):
+    """
+    Generates a caption or rephrases a prompt using a specified LLM service.
+    Supports both text-only and vision-language models.
+    """
+    content = [{"type": "text", "text": prompt}]
+    if image_paths:
+        for path in image_paths:
+            base64_image = encode_image_to_base64(path)
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_image}"
+                }
+            })
+
+    messages = [{"role": "user", "content": content}]
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_tokens=300
+        )
+        result = response.choices[0].message.content.strip()
+
+        if decision:
+            if result.lower() in prompt.lower() or prompt.lower() in result.lower():
+                 return False
+
+        return result
+    except Exception as e:
+        print(f"Error calling LLM API: {e}")
+        return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="imageRAG pipeline")
-    parser.add_argument("--openai_api_key", type=str)
+
+    # --- API 和模型配置参数  ---
+    # MODIFIED: 保留参数名，但明确其用途是 SiliconFlow Key。可以从环境变量 SILICONFLOW_API_KEY 读取
+    parser.add_argument("--openai_api_key", type=str, default=os.getenv("SILICONFLOW_API_KEY"), help="Your SiliconFlow API key (argument name kept for consistency).")
+    # MODIFIED: 重命名为 --llm_model 并设为必填
+    parser.add_argument("--llm_model", type=str, required=True, help="Model name from SiliconFlow to use (e.g., 'Qwen/Qwen3-VL-30B-A3B-Instruct').")
+
+    # --- 原始参数 ---
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--device", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
@@ -29,10 +86,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    openai.api_key = args.openai_api_key
-    os.environ["OPENAI_API_KEY"] = openai.api_key
-    client = openai.OpenAI()
+    # --- 初始化LLM客户端 (已修改) ---
+    # MODIFIED: 客户端固定指向 SiliconFlow
+    if not args.openai_api_key:
+        raise ValueError("SiliconFlow API key is required. Use --openai_api_key or set the SILICONFLOW_API_KEY environment variable.")
 
+    llm_client = openai.OpenAI(
+        api_key=args.openai_api_key,
+        base_url="https://api.siliconflow.cn/v1"
+    )
+
+    # --- 脚本主体逻辑 (与之前版本基本保持一致) ---
     os.makedirs(args.out_path, exist_ok=True)
     out_txt_file = os.path.join(args.out_path, args.out_name + ".txt")
     f = open(out_txt_file, "w")
@@ -90,10 +154,11 @@ if __name__ == "__main__":
             ).images[0]
             out_image.save(cur_out_path)
 
-        ans = retrieval_caption_generation(args.prompt, [cur_out_path],
-                                           gpt_client=client,
-                                           k_captions_per_concept=1,
-                                           k_concepts=1,
+        # MODIFIED: 使用 --llm_model
+        ans = generate_caption_or_rephrase(llm_client,
+                                           args.llm_model,
+                                           args.prompt,
+                                           image_paths=[cur_out_path],
                                            only_rephrase=args.only_rephrase)
         if type(ans) != bool:
             if args.only_rephrase:
@@ -116,15 +181,17 @@ if __name__ == "__main__":
             print("result matches prompt, not running imageRAG.")
             exit()
     else:
-        caption = retrieval_caption_generation(args.prompt, [],
-                                               gpt_client=client,
-                                               k_captions_per_concept=1,
+        # MODIFIED: 使用 --llm_model
+        caption = generate_caption_or_rephrase(llm_client,
+                                               args.llm_model,
+                                               args.prompt,
+                                               image_paths=[],
                                                decision=False)
         caption = convert_res_to_captions(caption)[0]
         f.write(f"captions: {caption}\n")
 
     paths = retrieve_img_per_caption([caption], retrieval_image_paths, embeddings_path=embeddings_path,
-                                        k=1, device=device, method=args.retrieval_method)
+                                     k=1, device=device, method=args.retrieval_method)
     image_path = np.array(paths).flatten()[0]
     print("ref path:", image_path)
 

@@ -10,8 +10,15 @@ from utils import *
 def run_omnigen(prompt, input_images, out_path, args):
     print("running OmniGen inference")
     device = f"cuda:{args.device}" if int(args.device) >= 0 else "cuda"
-    pipe = OmniGenPipeline.from_pretrained("Shitao/OmniGen-v1", device=device,
-                                           model_cpu_offload=args.model_cpu_offload)
+
+    # 从 from_pretrained 调用中移除所有不支持的参数
+    # 只需要保留模型名称即可
+    pipe = OmniGenPipeline.from_pretrained("Shitao/OmniGen-v1")
+
+    # 将加载好的 pipeline 移动到 GPU
+    pipe.to(device)
+
+    # 后面的代码保持不变
     images = pipe(prompt=prompt, input_images=input_images, height=args.height, width=args.width,
                   guidance_scale=args.guidance_scale, img_guidance_scale=args.image_guidance_scale,
                   seed=args.seed, use_input_image_size_as_output=args.use_input_image_size_as_output)
@@ -22,6 +29,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="imageRAG pipeline")
     parser.add_argument("--omnigen_path", type=str)
     parser.add_argument("--openai_api_key", type=str)
+    # ADDED: New argument for the custom LLM model name
+    parser.add_argument("--llm_model", type=str, default="Pro/Qwen/Qwen2.5-VL-7B-Instruct", help="The name of the LLM model to use.")
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--device", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
@@ -46,9 +55,13 @@ if __name__ == "__main__":
     sys.path.append(args.omnigen_path)
     from OmniGen import OmniGenPipeline
 
-    openai.api_key = args.openai_api_key
-    os.environ["OPENAI_API_KEY"] = openai.api_key
-    client = openai.OpenAI()
+    # CHANGED: Initialize the client with the custom base URL from siliconflow
+    # The URL for the base_url should not include the /chat/completions part.
+    client = openai.OpenAI(
+        api_key=args.openai_api_key,
+        base_url="https://api.siliconflow.cn/v1/"
+    )
+    os.environ["OPENAI_API_KEY"] = args.openai_api_key # Some libraries might still read from env
 
     os.makedirs(args.out_path, exist_ok=True)
     out_txt_file = os.path.join(args.out_path, args.out_name + ".txt")
@@ -77,10 +90,12 @@ if __name__ == "__main__":
             run_omnigen(args.prompt, input_images, out_path, args)
 
         if args.only_rephrase:
+            # CHANGED: Pass the model name to the function
             rephrased_prompt = retrieval_caption_generation(args.prompt, input_images + [out_path],
-                                                            gpt_client=client,
-                                                            k_captions_per_concept=k_captions_per_concept,
-                                                            only_rephrase=args.only_rephrase)
+                                                                gpt_client=client,
+                                                                model=args.llm_model,
+                                                                k_captions_per_concept=k_captions_per_concept,
+                                                                only_rephrase=args.only_rephrase)
             if rephrased_prompt == True:
                 f.write("result matches prompt, not running imageRAG.")
                 f.close()
@@ -93,10 +108,12 @@ if __name__ == "__main__":
             f.close()
             exit()
         else:
+            # CHANGED: Pass the model name to the function
             ans = retrieval_caption_generation(args.prompt,
-                                               input_images + [out_path],
-                                               gpt_client=client,
-                                               k_captions_per_concept=k_captions_per_concept)
+                                                 input_images + [out_path],
+                                                 gpt_client=client,
+                                                 model=args.llm_model,
+                                                 k_captions_per_concept=k_captions_per_concept)
 
             if type(ans) != bool:
                 captions = convert_res_to_captions(ans)
@@ -109,11 +126,13 @@ if __name__ == "__main__":
         omnigen_out_path = out_path
 
     elif args.mode == "generation":
+        # CHANGED: Pass the model name to the function
         captions = retrieval_caption_generation(args.prompt,
-                                                input_images,
-                                                gpt_client=client,
-                                                k_captions_per_concept=k_captions_per_concept,
-                                                decision=False)
+                                                  input_images,
+                                                  gpt_client=client,
+                                                  model=args.llm_model,
+                                                  k_captions_per_concept=k_captions_per_concept,
+                                                  decision=False)
         captions = convert_res_to_captions(captions)
         f.write(f"captions: {captions}\n")
 

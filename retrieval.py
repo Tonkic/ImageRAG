@@ -55,6 +55,7 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
             text_similarity_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
 
             text_sim = text_similarity_matrix.cpu().numpy().squeeze()
+            text_sim = np.atleast_1d(text_sim)
             text_sim = np.concatenate([top_text_im_scores, text_sim])
             cur_paths = np.concatenate([top_text_im_paths, final_bi_paths])
             top_similarities = text_sim.argsort()[-k:]
