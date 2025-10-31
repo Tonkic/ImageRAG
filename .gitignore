@@ -1,0 +1,10 @@
+
+# Datasets and Results
+datasets/
+results/
+
+# Python cache
+__pycache__/
+
+# Log files
+nohup.out
