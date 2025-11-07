@@ -216,6 +216,7 @@
                 📄 lora_pipeline.py
                 📄 pipeline_utils.py
                 📂 omnigen2/
+                    📄 pipeline_omnigen2 copy.py
                     📄 pipeline_omnigen2.py
                     📄 pipeline_omnigen2_chat.py
             📂 schedulers/
