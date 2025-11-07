@@ -1,18 +1,16 @@
+# Git 仓库
+OmniGen/
+OmniGen2/
+OmniGen2-EditScore7B/
+CLIP/
 
-# Datasets and Results
+# 大型数据集和文件
 datasets/
 results/
 hf_cache/
-# Python cache
-__pycache__/
-
-# Log files
-nohup.out
-
 ILSVRC2012_img_train.tar
 
-# other git
-Omnigen/
-Omnigen2/
-OmniGen2-EditScore7B/
-CLIP/
+# Python 缓存和日志
+__pycache__/
+*.pyc
+nohup.out
