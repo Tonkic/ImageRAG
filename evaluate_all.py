@@ -1,3 +1,17 @@
+'''
+python evaluate_all.py \
+--dataset_name cub \
+--device_id 0 \
+--results_dir results/CUB_OmniGen2_LoRA \
+--cub_classes_txt CUB_200_2011/classes.txt
+
+python evaluate_all.py \
+--dataset_name aircraft \
+--device_id 0 \
+--results_dir results/Aircraft_OmniGen2_LoRA
+'''
+
+
 import os
 import torch
 import torch.nn.functional as F

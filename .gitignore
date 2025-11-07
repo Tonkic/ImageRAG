@@ -2,7 +2,7 @@
 # Datasets and Results
 datasets/
 results/
-
+hf_cache/
 # Python cache
 __pycache__/
 

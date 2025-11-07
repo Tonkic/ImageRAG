@@ -151,16 +151,16 @@ def load_aircraft_data(args):
 
 # --- 4. 主函数 ---
 def main():
-    parser = argparse.ArgumentParser(description="Unified Evaluation Script for RAG vs No-RAG")
+    parser = argparse.ArgumentParser(description="Unified Evaluation Script for Pre-RAG outputs")
     parser.add_argument("--dataset_name", type=str, required=True, choices=['cub', 'aircraft'], help="Dataset to evaluate.")
     parser.add_argument("--device_id", type=int, required=True, help="GPU device ID to use for evaluation.")
-    parser.add_argument("--results_dir", type=str, required=True, help="Path to the results folder (e.g., results/CUB_OmniGen2_LoRA)")
+    parser.add_argument("--results_dir", type=str, required=True, help="Path to the results folder (e.g., results/PreRAG)")
 
-    # --- 关键修复：CUB 路径现在指向 'datasets/' 内部 ---
+    # --- CUB 路径 (已根据您的反馈 修复) ---
     parser.add_argument("--cub_classes_txt", type=str, default="datasets/CUB_200_2011/classes.txt", help="Path for CUB classes.txt")
     parser.add_argument("--cub_real_images_dir", type=str, default="datasets/CUB_test", help="Path for CUB_test real images")
-    # ----------------------------------------------------------------
 
+    # --- Aircraft 路径 (已修复) ---
     parser.add_argument("--aircraft_data_dir", type=str, default="datasets/fgvc-aircraft-2013b/data", help="Path for aircraft 'data' folder")
     parser.add_argument("--aircraft_classes_txt", type=str, default="datasets/fgvc-aircraft-2013b/data/variants.txt", help="Path for aircraft 'variants.txt'")
 
@@ -174,9 +174,8 @@ def main():
     # 加载所有模型
     models = load_models(device)
 
-    # 为 "no RAG" 和 "RAG" 分别创建分数列表
-    scores_no_rag = {'clip': [], 'siglip': [], 'dino': []}
-    scores_rag = {'clip': [], 'siglip': [], 'dino': []}
+    # --- 已修改：只为 PreRAG 创建一个分数列表 ---
+    scores = {'clip': [], 'siglip': [], 'dino': []}
 
     # 根据选择的数据集加载任务
     if args.dataset_name == 'cub':
@@ -213,49 +212,28 @@ def main():
                 text_features_siglip = models['siglip_model'].encode_text(text_siglip_input)
                 text_features_siglip = F.normalize(text_features_siglip, dim=-1)
 
-            # 2. 查找并评估 "no RAG" 图像 (e.g., ..._no_imageRAG.png)
-            no_rag_filename = f"{safe_filename}_no_imageRAG.png"
-            no_rag_image_path = os.path.join(args.results_dir, no_rag_filename)
+            # --- 已修改：只查找 "PreRAG" 图像 ---
+            # (e.g., ..._PreRAG.png)
+            pre_rag_filename = f"{safe_filename}_PreRAG.png"
+            pre_rag_image_path = os.path.join(args.results_dir, pre_rag_filename)
 
-            if os.path.exists(no_rag_image_path):
-                gen_image_pil = Image.open(no_rag_image_path).convert("RGB")
+            if os.path.exists(pre_rag_image_path):
+                gen_image_pil = Image.open(pre_rag_image_path).convert("RGB")
                 with torch.no_grad():
                     # DINO
                     gen_dino_input = models['dino_transform'](gen_image_pil).unsqueeze(0).to(device)
                     gen_features_dino = models['dino_model'](gen_dino_input)
-                    scores_no_rag['dino'].append(F.cosine_similarity(gen_features_dino, real_features_dino).item())
+                    scores['dino'].append(F.cosine_similarity(gen_features_dino, real_features_dino).item())
                     # CLIP
                     gen_clip_input = models['clip_preprocess'](gen_image_pil).unsqueeze(0).to(device)
                     gen_features_clip = models['clip_model'].encode_image(gen_clip_input)
                     gen_features_clip /= gen_features_clip.norm(dim=-1, keepdim=True)
-                    scores_no_rag['clip'].append((gen_features_clip @ text_features_clip.T).item())
+                    scores['clip'].append((gen_features_clip @ text_features_clip.T).item())
                     # SigLIP
                     gen_siglip_input = models['siglip_preprocess'](gen_image_pil).unsqueeze(0).to(device)
                     gen_features_siglip = models['siglip_model'].encode_image(gen_siglip_input)
                     gen_features_siglip = F.normalize(gen_features_siglip, dim=-1)
-                    scores_no_rag['siglip'].append((gen_features_siglip @ text_features_siglip.T).item())
-
-            # 3. 查找并评估 "RAG" 图像 (e.g., ..._EDITED.png)
-            rag_filename = f"{safe_filename}_EDITED.png"
-            rag_image_path = os.path.join(args.results_dir, rag_filename)
-
-            if os.path.exists(rag_image_path):
-                gen_image_pil = Image.open(rag_image_path).convert("RGB")
-                with torch.no_grad():
-                    # DINO
-                    gen_dino_input = models['dino_transform'](gen_image_pil).unsqueeze(0).to(device)
-                    gen_features_dino = models['dino_model'](gen_dino_input)
-                    scores_rag['dino'].append(F.cosine_similarity(gen_features_dino, real_features_dino).item())
-                    # CLIP
-                    gen_clip_input = models['clip_preprocess'](gen_image_pil).unsqueeze(0).to(device)
-                    gen_features_clip = models['clip_model'].encode_image(gen_clip_input)
-                    gen_features_clip /= gen_features_clip.norm(dim=-1, keepdim=True)
-                    scores_rag['clip'].append((gen_features_clip @ text_features_clip.T).item())
-                    # SigLIP
-                    gen_siglip_input = models['siglip_preprocess'](gen_image_pil).unsqueeze(0).to(device)
-                    gen_features_siglip = models['siglip_model'].encode_image(gen_siglip_input)
-                    gen_features_siglip = F.normalize(gen_features_siglip, dim=-1)
-                    scores_rag['siglip'].append((gen_features_siglip @ text_features_siglip.T).item())
+                    scores['siglip'].append((gen_features_siglip @ text_features_siglip.T).item())
 
         except Exception as e:
             print(f"\n处理 {task['safe_filename']} 时出错: {e}")
@@ -263,23 +241,14 @@ def main():
     # --- 5. 显示最终结果 ---
     print(f"\n--- 评估完成 ({args.dataset_name}) ---")
 
-    print(f"\n--- 评估结果 (初始生成 / no RAG) ---")
-    if len(scores_no_rag['clip']) > 0:
-        print(f"CLIP Score :   {np.mean(scores_no_rag['clip']):.4f}")
-        print(f"SigLIP Score : {np.mean(scores_no_rag['siglip']):.4f}")
-        print(f"DINO Score :   {np.mean(scores_no_rag['dino']):.4f}")
-        print(f"\n(基于 {len(scores_no_rag['clip'])} / {len(tasks_to_evaluate)} 个已找到的 'no RAG' 图像)")
+    print(f"\n--- 评估结果 (Pre-RAG) ---")
+    if len(scores['clip']) > 0:
+        print(f"CLIP Score :   {np.mean(scores['clip']):.4f}")
+        print(f"SigLIP Score : {np.mean(scores['siglip']):.4f}")
+        print(f"DINO Score :   {np.mean(scores['dino']):.4f}")
+        print(f"\n(基于 {len(scores['clip'])} / {len(tasks_to_evaluate)} 个已找到的 'PreRAG' 图像)")
     else:
-        print("未找到 'no RAG' 图像 (例如: *_no_imageRAG.png)")
-
-    print(f"\n--- 评估结果 (RAG后 / EDITED) ---")
-    if len(scores_rag['clip']) > 0:
-        print(f"CLIP Score :   {np.mean(scores_rag['clip']):.4f}")
-        print(f"SigLIP Score : {np.mean(scores_rag['siglip']):.4f}")
-        print(f"DINO Score :   {np.mean(scores_rag['dino']):.4f}")
-        print(f"\n(基于 {len(scores_rag['clip'])} / {len(tasks_to_evaluate)} 个已找到的 'RAG' 图像)")
-    else:
-        print("未找到 'RAG' 图像 (例如: *_EDITED.png)")
+        print("未找到 'PreRAG' 图像 (例如: *_PreRAG.png)")
 
 if __name__ == "__main__":
     main()
