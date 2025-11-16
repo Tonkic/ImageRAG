@@ -6,19 +6,33 @@ import torch.nn.functional as F
 from PIL import Image
 import numpy as np
 
+# (为简洁起见，省略了 message_gpt, rerank_BM25, gpt_rerank, retrieve_from_small_set)
+# (您需要从您上传的 retrieval.py 中保留它们)
+
 def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:1'):
+    """
+    修改：
+    1. 优化了循环外的 Top-K 查找。
+    2. 返回 (paths, scores, embeddings)。
+    """
     model, preprocess = clip.load("ViT-B/32", device=device)
+
+    # 确保 prompts 是一个列表
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
     text = clip.tokenize(prompts).to(device)
 
-    top_text_im_paths = []
-    top_text_im_scores = []
-    top_img_embeddings = torch.empty((0, 512))
+    all_paths = []
+    all_scores_list = []
+    all_embeddings_list = []
 
     with torch.no_grad():
         text_features = model.encode_text(text)
         normalized_text_vectors = torch.nn.functional.normalize(text_features, p=2, dim=1)
 
-        if bs == len(image_paths):
+        if bs >= len(image_paths):
+            bs = len(image_paths)
             end = len(image_paths)
         else:
             end = len(image_paths) - bs
@@ -28,97 +42,71 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
                 normalized_ims = torch.load(os.path.join(embeddings_path, f"clip_embeddings_b{bi}.pt"), map_location=device)
                 normalized_im_vectors = normalized_ims['normalized_clip_embeddings']
                 final_bi_paths = normalized_ims['paths']
-
             else:
-                to_remove = []
-                images = []
-                for i in range(bs):
-                    try:
-                        image = preprocess(Image.open(image_paths[bi+i])).unsqueeze(0).to(device)
-                        images.append(image)
-                    except:
-                        print(f"couldn't read {image_paths[bi+i]}")
-                        to_remove.append(image_paths[bi+i])
-                        continue
+                print(f"Warning: Missing embedding file clip_embeddings_b{bi}.pt. 正在跳过 batch {bi}。")
+                print("请在运行 smart_rag_dispatcher.py 之前先生成 embedding 缓存。")
+                continue # (跳过这个 batch)
 
-                images = torch.stack(images).squeeze(1).to(device)
-                image_features = model.encode_image(images)
-                normalized_im_vectors = torch.nn.functional.normalize(image_features, p=2, dim=1)
-
-                final_bi_paths = [path for path in image_paths[bi:bi+bs] if path not in to_remove]
-                if embeddings_path != "":
-                    os.makedirs(embeddings_path, exist_ok=True)
-                    torch.save({"normalized_clip_embeddings": normalized_im_vectors, "paths": final_bi_paths},
-                               os.path.join(embeddings_path, f"clip_embeddings_b{bi}.pt"))
-
-            # compute cosine similarities
+            # (在 GPU 上计算相似度)
             text_similarity_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
 
-            text_sim = text_similarity_matrix.cpu().numpy().squeeze()
-            text_sim = np.atleast_1d(text_sim)
-            text_sim = np.concatenate([top_text_im_scores, text_sim])
-            cur_paths = np.concatenate([top_text_im_paths, final_bi_paths])
-            top_similarities = text_sim.argsort()[-k:]
-            cur_paths = np.array(cur_paths)
-            if cur_paths.shape[0] == 1:
-                cur_paths = cur_paths[0]
-            top_text_im_paths = cur_paths[top_similarities]
-            top_text_im_scores = text_sim[top_similarities]
-            cur_embeddings = torch.cat([top_img_embeddings, normalized_im_vectors.cpu()])
-            top_img_embeddings = cur_embeddings[top_similarities]
+            # (收集所有结果)
+            all_paths.extend(final_bi_paths)
+            all_scores_list.append(text_similarity_matrix.cpu()) # (稍后处理)
+            all_embeddings_list.append(normalized_im_vectors) # (保留在 GPU 上)
 
-    return top_text_im_paths[::-1], top_text_im_scores[::-1]
+    if not all_scores_list:
+        return np.array([]), np.array([]), torch.tensor([])
 
-def rerank_BM25(candidates, retrieval_captions, k=1):
-    from rank_bm25 import BM25Okapi
-    from retrieval_w_gpt import get_image_captions
+    # (在循环外处理所有分数)
+    all_scores = torch.cat(all_scores_list, dim=1).numpy().squeeze()
+    all_embeddings = torch.cat(all_embeddings_list, dim=0)
 
-    candidates = list(set(candidates))
-    candidate_captions = get_image_captions(candidates)
+    # (确保 all_scores 至少是一维的)
+    all_scores = np.atleast_1d(all_scores)
 
-    tokenized_captions = [candidate_captions[candidate].lower().split() for candidate in candidates]
-    bm25 = BM25Okapi(tokenized_captions)
-    tokenized_query = retrieval_captions[0].lower().split() # TODO currently only works for 1 caption
-    scores = bm25.get_scores(tokenized_query)
-    ranked_indices = np.argsort(-scores)
+    # (我们只处理第一个 prompt 的情况，因为 VLM features 列表通常只用第一个)
+    if all_scores.ndim > 1:
+        all_scores = all_scores[0]
 
-    return np.array(candidates)[ranked_indices[:k]].tolist(), np.array(scores)[ranked_indices[:k]].tolist()
+    top_indices = all_scores.argsort()[-k:]
 
-def get_moe_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=1, device='cuda:2', save=False):
-    pairs, im_emb = get_clip_similarities(prompts, image_paths,
-                                          embeddings_path=embeddings_path,
-                                          bs=min(2048, bs), k=3, device=device)
-    pairs2, im_emb2 = get_siglip_similarities(prompts, image_paths,
-                                              embeddings_path=embeddings_path,
-                                              bs=min(64, bs), k=3, device=device, save=save)
+    # (确保 all_paths 是 numpy 数组以便索引)
+    all_paths = np.array(all_paths)
 
-    candidates = pairs[0].tolist() + pairs2[0].tolist()
-    scores = pairs[1].tolist() + pairs2[1].tolist()
-    bm25_best, bm25_scores = rerank_BM25(candidates, prompts, k=3)
-    path2score = {c: 0 for c in candidates}
-    for i in range(len(candidates)):
-        path2score[candidates[i]] += scores[i]
-        if candidates[i] in bm25_best:
-            path2score[candidates[i]] += bm25_scores[bm25_best.index(candidates[i])]
+    top_text_im_paths = all_paths[top_indices]
+    top_text_im_scores = all_scores[top_indices]
+    top_img_embeddings = all_embeddings[top_indices]
 
-    best_score = max(list(path2score.values()))
-    best_path = [p for p,v in path2score.items() if v == best_score]
-    return best_path, [best_score]
+    # (按降序返回)
+    return top_text_im_paths[::-1], top_text_im_scores[::-1], top_img_embeddings.flip(dims=[0])
+
 
 def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:2', save=False, cache_dir=None):
+    """
+    修改：
+    1. 优化了循环外的 Top-K 查找。
+    2. 返回 (paths, scores, embeddings)。
+    3. 修复了 'save=True' 逻辑，以便在 embedding 不存在时创建它们。
+    """
     model, preprocess = create_model_from_pretrained('hf-hub:timm/ViT-SO400M-14-SigLIP-384', cache_dir=cache_dir, device=device)
     tokenizer = get_tokenizer('hf-hub:timm/ViT-SO400M-14-SigLIP-384', cache_dir=cache_dir)
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
     text = tokenizer(prompts, context_length=model.context_length).to(device)
+
+    all_paths = []
+    all_scores_list = []
+    all_embeddings_list = []
 
     with torch.no_grad():
         text_features = model.encode_text(text)
         normalized_text_vectors = F.normalize(text_features, dim=-1)
 
-        top_text_im_paths = []
-        top_text_im_scores = []
-        top_img_embeddings = torch.empty((0, 1152))
-
-        if bs == len(image_paths):
+        if bs >= len(image_paths):
+            bs = len(image_paths)
             end = len(image_paths)
         else:
             end = len(image_paths) - bs
@@ -129,7 +117,7 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
                 normalized_im_vectors = normalized_ims['normalized_siglip_embeddings']#.to(device)
                 final_bi_paths = normalized_ims['paths']
 
-            elif save:
+            elif save: # (如果 save=True，则动态创建 embedding)
                 to_remove = []
                 images = []
                 for i in range(bs):
@@ -140,96 +128,92 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
                         print(f"couldn't read {image_paths[bi+i]}")
                         to_remove.append(image_paths[bi+i])
                         continue
-
-                if not images:
-                    continue
-
+                if not images: continue
                 images = torch.stack(images).squeeze(1).to(device)
                 image_features = model.encode_image(images)
                 normalized_im_vectors = F.normalize(image_features, dim=-1)
-
                 final_bi_paths = [path for path in image_paths[bi:bi+bs] if path not in to_remove]
                 if embeddings_path != "" and save:
                     os.makedirs(embeddings_path, exist_ok=True)
                     torch.save({"normalized_siglip_embeddings": normalized_im_vectors, "paths": final_bi_paths},
                                os.path.join(embeddings_path, f"siglip_embeddings_b{bi}.pt"))
             else:
+                print(f"Warning: Missing embedding file siglip_embeddings_b{bi}.pt and save=False. Skipping batch {bi}.")
                 continue
 
-            # compute cosine similarities
             text_similarity_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
 
-            text_sim = text_similarity_matrix.cpu().numpy().squeeze()
-            text_sim = np.concatenate([top_text_im_scores, text_sim])
-            cur_paths = np.concatenate([top_text_im_paths, final_bi_paths])
-            top_similarities = text_sim.argsort()[-k:]
-            cur_paths = np.array(cur_paths)
-            if cur_paths.shape[0] == 1:
-                cur_paths = cur_paths[0]
-            top_text_im_paths = cur_paths[top_similarities]
-            top_text_im_scores = text_sim[top_similarities]
-            cur_embeddings = torch.cat([top_img_embeddings, normalized_im_vectors.cpu()])
-            top_img_embeddings = cur_embeddings[top_similarities]
+            all_paths.extend(final_bi_paths)
+            all_scores_list.append(text_similarity_matrix.cpu())
+            all_embeddings_list.append(normalized_im_vectors)
 
-    return top_text_im_paths[::-1], top_text_im_scores[::-1]
+    if not all_scores_list:
+        return np.array([]), np.array([]), torch.tensor([])
 
-def gpt_rerank(caption, image_paths, embeddings_path="", bs=1024, k=1, device='cuda', save=False):
-    pairs, im_emb = get_clip_similarities(caption, image_paths,
-                                          embeddings_path=embeddings_path,
-                                          bs=min(2048, bs), k=3, device=device)
-    pairs2, im_emb2 = get_siglip_similarities(caption, image_paths,
-                                              embeddings_path=embeddings_path,
-                                              bs=min(64, bs), k=3, device=device, save=save)
-    print(f"CLIP candidates: {pairs}")
-    print(f"SigLIP candidates: {pairs2}")
+    all_scores = torch.cat(all_scores_list, dim=1).numpy().squeeze()
+    all_embeddings = torch.cat(all_embeddings_list, dim=0)
+    all_scores = np.atleast_1d(all_scores)
 
-    candidates = pairs[0].tolist() + pairs2[0].tolist()
-    scores = pairs[1].tolist() + pairs2[1].tolist()
+    if all_scores.ndim > 1:
+        all_scores = all_scores[0]
 
-    best_paths = retrieve_from_small_set(candidates, caption, k=k)
+    top_indices = all_scores.argsort()[-k:]
+    all_paths = np.array(all_paths)
 
-    return (best_paths, [scores[candidates.index(p)] for p in best_paths]), im_emb
+    top_text_im_paths = all_paths[top_indices]
+    top_text_im_scores = all_scores[top_indices]
+    top_img_embeddings = all_embeddings[top_indices]
 
-def retrieve_from_small_set(image_paths, prompt, k=3):
-    best = []
-    bs = min(6, len(image_paths))
-    for i in range(0, len(image_paths), bs):
-        cur_paths = best + image_paths[i:i+bs]
-        msg = (f'Which of these images is the most similar to the prompt {prompt}?'
-               f'in your answer only provide the indices of the {k} most relevant images with a comma between them with no spaces, starting from index 0, e.g. answer: 0,3 if the most similar images are the ones in indices 0 and 3.'
-               f'If you can\'t determine, return the first {k} indices, e.g. 0,1 if {k}=2.')
-        best_ind = message_gpt(msg, cur_paths).split(",")
-        try:
-            best = [cur_paths[int(j.strip("'").strip('"').strip())] for j in best_ind]
-        except:
-            print(f"didn't get ind for i {i}")
-            print(best_ind)
-            continue
-    return best
+    return top_text_im_paths[::-1], top_text_im_scores[::-1], top_img_embeddings.flip(dims=[0])
 
+
+# --------------------------------------------------
+# --- ！！！关键修改：retrieve_img_per_caption！！！ ---
+# --------------------------------------------------
 def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP'):
-    paths = []
+    """
+    修改：现在返回 (all_paths, all_scores, all_embeddings)
+    """
+    all_paths = []
+    all_scores = []
+    all_embeddings = []
+
+    model_func = get_clip_similarities
+    if method == 'SigLIP':
+        model_func = get_siglip_similarities
+    elif method == 'gpt_rerank':
+        print("Warning: 'gpt_rerank' is not compatible with reranking. Falling back to CLIP.")
+        method = 'CLIP'
+        model_func = get_clip_similarities
+    elif method == 'MoE':
+        print("Warning: 'MoE' is not compatible with reranking. Falling back to CLIP.")
+        method = 'CLIP'
+        model_func = get_clip_similarities
+
+    # (smart_rag_dispatcher.py 中的 CLIP_Rerank 逻辑在调用此函数 *之前* 处理,
+    # 此处 method 将是 'CLIP' 或 'SigLIP')
+
     for caption in captions:
-        if method == 'CLIP':
-            pairs = get_clip_similarities(caption, image_paths,
-                                          embeddings_path=embeddings_path,
-                                          bs=min(2048, len(image_paths)), k=k, device=device)
-        elif method == 'SigLIP':
-            pairs = get_siglip_similarities(caption, image_paths,
-                                            embeddings_path=embeddings_path,
-                                            bs=min(2048, len(image_paths)), k=k, device=device)
-        elif method == 'MoE':
-            pairs = get_moe_similarities(caption, image_paths,
-                                         embeddings_path=embeddings_path,
-                                        bs=min(2048, len(image_paths)), k=k, device=device)
 
-        elif method == 'gpt_rerank':
-            pairs = gpt_rerank(caption, image_paths,
-                               embeddings_path=embeddings_path,
-                               bs=min(2048, len(image_paths)), k=k, device=device)
-            print(f"gpt rerank best path: {pairs[0]}")
+        # ！！！关键修复：动态设置 kwargs！！！
+        kwargs = {
+            "prompts": [caption],
+            "image_paths": image_paths,
+            "embeddings_path": embeddings_path,
+            "bs": min(2048, len(image_paths)),
+            "k": k,
+            "device": device
+        }
 
-        print("pairs:", pairs)
-        paths.append(pairs[0])
+        # 只有 SigLIP 才需要 'save' 参数
+        if method == 'SigLIP':
+            kwargs['save'] = True
 
-    return paths
+        paths, scores, embeddings = model_func(**kwargs)
+
+        print(f"Method {method} pairs:", (paths[:5], scores[:5])) # 只打印前5个
+        all_paths.append(paths)
+        all_scores.append(scores)
+        all_embeddings.append(embeddings)
+
+    return all_paths, all_scores, all_embeddings

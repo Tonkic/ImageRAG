@@ -3,7 +3,7 @@
 ============================================================
 
 📂 .//
-    📦 包含 21 个文件 (数量过多，不一一列出)
+    📦 包含 25 个文件 (数量过多，不一一列出)
     📂 CLIP/
         📂 CLIP/
             📄 .gitignore
@@ -219,6 +219,7 @@
                     📄 pipeline_omnigen2 copy.py
                     📄 pipeline_omnigen2.py
                     📄 pipeline_omnigen2_chat.py
+                    📄 pipeline_omnigen2_forbid.py
             📂 schedulers/
                 📄 __init__.py
                 📄 scheduling_dpmsolver_multistep.py
@@ -278,6 +279,7 @@
             📄 teaser.png
     📂 datasets/
         📄 CUB_200_2011.tgz
+        📄 ILSVRC2012_img_train.tar
         📄 attributes.txt
         📄 fgvc-aircraft-2013b.tar.gz
         📄 jq8wuc1xnik142b4lrnlb6b.zip
@@ -298,9 +300,20 @@
                 📄 part_click_locs.txt
                 📄 part_locs.txt
                 📄 parts.txt
+        📂 ILSVRC2012_train/
+            📚 包含 1001 个子目录 (数量过多，不一一列出)
+            📄 ILSVRC2012_devkit_t12.tar.gz
         📂 embeddings/
+            📂 aircraft/
+                📄 clip_embeddings_b0.pt
             📂 aircraft_train/
                 📄 clip_embeddings_b0.pt
+            📂 cub/
+                📄 clip_embeddings_b0.pt
+                📄 clip_embeddings_b2048.pt
+                📄 clip_embeddings_b4096.pt
+                📄 clip_embeddings_b6144.pt
+                📄 clip_embeddings_b8192.pt
             📂 datasets_CUB_train/
                 📄 clip_embeddings_b0.pt
                 📄 clip_embeddings_b2048.pt
@@ -357,9 +370,15 @@
             📦 包含 287 个文件 (数量过多，不一一列出)
         📂 Aircraft_QwenEdit/
             📄 000_707-320.txt
+        📂 Aircraft_SmartRAG/
+            📦 包含 332 个文件 (数量过多，不一一列出)
+        📂 Aircraft_SmartRAG_old_retrieval/
+            📦 包含 228 个文件 (数量过多，不一一列出)
         📂 CUB/
             📦 包含 576 个文件 (数量过多，不一一列出)
         📂 CUB_OmniGen2_LoRA/
             📦 包含 567 个文件 (数量过多，不一一列出)
+        📂 CUB_SmartRAG/
+            📦 包含 592 个文件 (数量过多，不一一列出)
         📂 PreRAG/
             📦 包含 534 个文件 (数量过多，不一一列出)

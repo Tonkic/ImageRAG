@@ -9,7 +9,7 @@
 3.  报告 B (公平比较): 评估 Baseline (V1) vs True Final (最终结果)。
 
 用法:
-python evaluate_full_report.py \
+python evaluate_smart_rag.py \
     --dataset_name aircraft \
     --device_id 0
 '''
