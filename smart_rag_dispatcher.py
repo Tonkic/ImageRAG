@@ -33,7 +33,7 @@ import shutil
 parser = argparse.ArgumentParser(description="Smart RAG Dispatcher for OmniGen2 (Self-Correcting Loop Mode)")
 
 # --- 核心配置 ---
-parser.add_argument("--dataset_name", type=str, required=True, choices=['aircraft', 'cub'], help="要处理的数据集的通用名称 (例如: 'aircraft', 'cub')。")
+parser.add_argument("--dataset_name", type=str, required=True, choices=['aircraft', 'cub', 'imagenet'], help="要处理的数据集的通用名称 (例如: 'aircraft', 'cub', 'imagenet')。")
 parser.add_argument("--device_id", type=int, required=True, help="要使用的 GPU 设备 ID (例如 0, 1)")
 parser.add_argument("--task_index", type=int, required=True, help="任务块的索引 (例如 0, 1, 2)")
 parser.add_argument("--total_chunks", type=int, default=1, help="总共的任务块数 (例如 3)")
@@ -87,6 +87,12 @@ DATASET_CONFIGS = {
         "train_list": "datasets/CUB_200_2011/images.txt",
         "image_root": "datasets/CUB_200_2011/images",
         "output_path": "results/CUB_SmartRAG"
+    },
+    "imagenet": {
+    "classes_txt": "datasets/imagenet_classes.txt",
+    "train_list": "datasets/imagenet_train_list.txt",
+    "image_root": "datasets/ILSVRC2012_train",
+    "output_path": "results/ImageNet_SmartRAG"
     }
 }
 config = DATASET_CONFIGS[args.dataset_name]
@@ -99,9 +105,8 @@ args.embeddings_path = args.embeddings_path or f"datasets/embeddings/{args.datas
 
 
 # --------------------------------------------------
-# --- 辅助函数：run_omnigen2 (不变) ---
+# --- 辅助函数：run_omnigen2 (！！！已修复！！！) ---
 # --------------------------------------------------
-# (标准版：不包含 rag_images)
 def run_omnigen2(prompt, images_list, out_path, args, pipe, device):
     print(f"running OmniGen2 inference... (Prompt: {prompt[:50]}...)")
 
@@ -109,12 +114,23 @@ def run_omnigen2(prompt, images_list, out_path, args, pipe, device):
     if images_list:
         for img_input in images_list:
             try:
+                img = None # 初始化
                 if isinstance(img_input, str):
-                    pil_images.append(Image.open(img_input))
+                    img = Image.open(img_input)
                 elif isinstance(img_input, Image.Image):
-                    pil_images.append(img_input)
+                    img = img_input
                 else:
                     print(f"  [Warning] 未知的图像输入类型: {type(img_input)}")
+                    continue # 跳过这张图
+
+                # --- 关键修复：强制转换为 RGB ---
+                if img.mode != 'RGB':
+                    print(f"  [Info] 图像模式为 {img.mode}，正在转换为 RGB...")
+                    img = img.convert('RGB')
+
+                pil_images.append(img)
+                # --- 修复结束 ---
+
             except Exception as e:
                 print(f"  [Error] 无法处理图像: {img_input}, {e}")
                 return
@@ -217,6 +233,9 @@ if __name__ == "__main__":
                 elif args.dataset_name == 'cub':
                     image_filename = line.split(' ')[-1]
                     image_path = os.path.join(args.config_image_root, image_filename)
+                elif args.dataset_name == 'imagenet':
+                    # 假设 train_list.txt 包含 "n01440764/n01440764_10026.JPEG" 这样的行
+                    image_path = os.path.join(args.config_image_root, line)
                 else:
                     image_path = os.path.join(args.config_image_root, line)
                 if os.path.exists(image_path):
@@ -245,7 +264,14 @@ if __name__ == "__main__":
                 simple_name = full_class_name # 默认为 aircraft
                 if args.dataset_name == 'cub':
                     simple_name = full_class_name.split('.', 1)[-1].replace('_', ' ')
+                elif args.dataset_name == 'imagenet':
+                    # 输入行: "n02119789: kit fox, Vulpes macrotis"
+                    # 1. 去掉 ID 部分
+                    name_part = full_class_name.split(':', 1)[-1].strip()
+                    # 2. 只保留第一个逗号前的名称
+                    simple_name = name_part.split(',')[0]
 
+                # (修复了之前版本中 'append' 缩进错误的 bug)
                 all_items_to_generate.append((i, simple_name))
                 all_class_names.append(simple_name) # <-- 存储所有名称
 
@@ -292,10 +318,10 @@ if __name__ == "__main__":
 
     PREDEFINED_ERROR_TYPES = ["success", "missing_object", "spatial_error", "count_error", "text_error", "style_error", "color_error", "wrong_concept", "other"]
 
-    for label_id, full_class_name in tqdm(items_for_this_gpu, desc=f"Generating images on Device {args.device_id} (Task {args.task_index})"):
+    for label_id, simple_name in tqdm(items_for_this_gpu, desc=f"Generating images on Device {args.device_id} (Task {args.task_index})"):
 
-        current_prompt = f"a photo of a {full_class_name}"
-        safe_class_name = full_class_name.replace(' ', '_').replace('/', '_')
+        current_prompt = f"a photo of a {simple_name}"
+        safe_class_name = simple_name.replace(' ', '_').replace('/', '_')
         current_out_name = f"{label_id:03d}_{safe_class_name}"
         original_seed = args.seed
 
@@ -434,7 +460,7 @@ if __name__ == "__main__":
                  break
 
             # 阶段 2: 分类重排
-            target_label = full_class_name
+            target_label = simple_name
 
             try:
                 target_label_index = all_class_names.index(target_label)
@@ -536,7 +562,7 @@ if __name__ == "__main__":
                 f.write(f"\nMax retries ({args.max_retries}) reached. Stopping correction loop.\n")
                 f.write(f"Final failed image: {last_generated_image_path}\n")
 
-    f.close()
-    args.seed = original_seed # 恢复原始 seed 以便下一个 prompt
+        f.close()
+        args.seed = original_seed # 恢复原始 seed 以便下一个 prompt
 
-print(f"--- [Device {args.device_id}] Completed all {len(items_for_this_gpu)} tasks ---")
+    print(f"--- [Device {args.device_id}] Completed all {len(items_for_this_gpu)} tasks ---")

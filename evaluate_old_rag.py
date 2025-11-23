@@ -1,348 +1,372 @@
-'''
-python evaluate_old_rag.py \
-    --dataset_name aircraft \
-    --device_id 0 \
-    --ground_truth_root datasets/fgvc-aircraft-2013b/data/images
-'''
-
-
-import argparse
-import sys
 import os
+import sys
+import argparse
 import glob
+import shutil
 from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
+import torch
+import torch.nn.functional as F
+import clip
+from open_clip import create_model_from_pretrained, get_tokenizer
+from PIL import Image
+from torchvision import transforms
+from torchmetrics.image.kid import KernelInceptionDistance
 
-# --- 1. ！！！关键：立即解析参数！！！ ---
-parser = argparse.ArgumentParser(description="Evaluation script for 'old' RAG (Baseline vs RAG)")
-parser.add_argument("--dataset_name", type=str, required=True, choices=['aircraft', 'cub'])
+# ==========================================
+# 1. 参数解析 & 显卡设置
+# ==========================================
+parser = argparse.ArgumentParser(description="Evaluation script for 'old' RAG with DINO v1/v2/v3 (All ViT-B) + KID")
+parser.add_argument("--dataset_name", type=str, required=True, choices=['aircraft', 'cub', 'imagenet'])
 parser.add_argument("--device_id", type=int, required=True, help="GPU device ID")
-parser.add_argument("--ground_truth_root", type=str, required=True, help="Path to the root of ground truth images (e.g., .../CUB_200_2011/images)")
+parser.add_argument("--ground_truth_root", type=str, default=None, help="Optional: Override config GT root")
 parser.add_argument("--batch_size", type=int, default=32, help="Batch size for feature extraction")
 parser.add_argument("--clip_model_name", type=str, default="ViT-B/32")
 parser.add_argument("--siglip_model_name", type=str, default="ViT-SO400M-14-SigLIP-384")
-parser.add_argument("--dino_model_name", type=str, default="dinov2_vitb14")
 
+# --- DINO 配置 (统一 ViT-Base) ---
+parser.add_argument("--dino_v1_model_name", type=str, default="dino_vitb16", help="DINO v1 model name (Base)")
+parser.add_argument("--dino_v2_model_name", type=str, default="dinov2_vitb14", help="DINO v2 model name (Base)")
+
+# --- DINOv3 本地路径配置 ---
+parser.add_argument("--dinov3_repo_path", type=str,
+                    default="/home/tingyu/imageRAG/dinov3",
+                    help="Path to the cloned dinov3 github repository")
+parser.add_argument("--dinov3_weights_path", type=str,
+                    default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+                    help="Path to the local .pth weights file for DINOv3 ViT-B/16")
+
+# 解析参数
 args = parser.parse_args()
 
-# --- 2. ！！！关键：立即设置环境！！！ ---
+# 设置可见显卡
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
-
-# --- 3. ！！！现在才导入 torch 和其他库！！！ ---
-import torch
-import clip
-from open_clip import create_model_from_pretrained, get_tokenizer
-# import timm # <-- 不再需要
-from PIL import Image
-from torchvision import transforms # <-- 关键修复：导入 transforms
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --------------------------------------------------
-# --- 数据库配置中心 (与 imageRAG_OmniGen2.py 匹配) ---
+# --- 数据库配置中心 ---
 # --------------------------------------------------
 DATASET_CONFIGS = {
     "aircraft": {
         "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
-        "output_path": "results/Aircraft_SmartRAG_old_retrieval",
-        # ！！！关键修复：添加 aircraft GT 映射文件路径！！！
-        "gt_map_files_dir": "datasets/fgvc-aircraft-2013b/data"
+        "output_path": "results/Aircraft_old_RAG",
+        "gt_map_files_dir": "datasets/fgvc-aircraft-2013b/data",
+        "gt_root": "datasets/fgvc-aircraft-2013b/data/images"
     },
     "cub": {
         "classes_txt": "datasets/CUB_200_2011/classes.txt",
-        "output_path": "results/CUB_SmartRAG_old_retrieval"
+        "output_path": "results/CUB_old_RAG",
+        "gt_root": "datasets/CUB_200_2011/images"
+    },
+    "imagenet": {
+        "classes_txt": "datasets/imagenet_classes.txt",
+        "train_list": "datasets/imagenet_train_list.txt",
+        "output_path": "results/ImageNet_old_RAG",
+        "gt_root": "datasets/ILSVRC2012_train"
     }
 }
 
 # --------------------------------------------------
-# --- 辅助函数：模型加载 ---
+# --- 模型加载函数 ---
 # --------------------------------------------------
-def load_clip_model(device):
+def load_models(device):
+    models = {}
     print(f"Loading CLIP model: {args.clip_model_name}")
-    model, preprocess = clip.load(args.clip_model_name, device=device)
-    return model, preprocess
+    models['clip'], models['clip_preprocess'] = clip.load(args.clip_model_name, device=device)
 
-def load_siglip_model(device):
     print(f"Loading SigLIP model: {args.siglip_model_name}")
-    model, preprocess = create_model_from_pretrained(f'hf-hub:timm/{args.siglip_model_name}')
-    model = model.to(device)
-    tokenizer = get_tokenizer(f'hf-hub:timm/{args.siglip_model_name}')
-    return model, preprocess, tokenizer
+    models['siglip'], models['siglip_preprocess'] = create_model_from_pretrained(f'hf-hub:timm/{args.siglip_model_name}')
+    models['siglip'] = models['siglip'].to(device).eval()
+    models['siglip_tokenizer'] = get_tokenizer(f'hf-hub:timm/{args.siglip_model_name}')
 
-def load_dino_model(device):
-    print(f"Loading DINO V2 model: {args.dino_model_name} (from torch.hub)")
-    model = torch.hub.load('facebookresearch/dinov2', args.dino_model_name)
-    model = model.to(device)
-    model.eval()
-    preprocess = transforms.Compose([
+    print(f"Loading DINO v1 model: {args.dino_v1_model_name}")
+    models['dino_v1'] = torch.hub.load('facebookresearch/dino:main', args.dino_v1_model_name)
+    models['dino_v1'] = models['dino_v1'].to(device).eval()
+
+    print(f"Loading DINO v2 model: {args.dino_v2_model_name}")
+    models['dino_v2'] = torch.hub.load('facebookresearch/dinov2', args.dino_v2_model_name)
+    models['dino_v2'] = models['dino_v2'].to(device).eval()
+
+    print(f"Loading DINO v3 (Local ViT-B/16)...")
+    if args.dinov3_repo_path not in sys.path:
+        sys.path.append(args.dinov3_repo_path)
+    try:
+        models['dino_v3'] = torch.hub.load(repo_or_dir=args.dinov3_repo_path, model='dinov3_vitb16', source='local', pretrained=False)
+        checkpoint = torch.load(args.dinov3_weights_path, map_location='cpu')
+        state_dict = checkpoint.get('model', checkpoint.get('teacher', checkpoint.get('student', checkpoint)))
+        new_state_dict = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        models['dino_v3'].load_state_dict(new_state_dict, strict=False)
+        models['dino_v3'] = models['dino_v3'].to(device).eval()
+    except Exception as e:
+        print(f"Error loading DINOv3: {e}"); sys.exit(1)
+
+    models['dino_preprocess'] = transforms.Compose([
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
-    return model, preprocess
+
+    print("Initializing KID Metrics...")
+    models['kid_transform'] = transforms.Compose([transforms.Resize(299), transforms.CenterCrop(299), transforms.ToTensor()])
+    models['kid_baseline'] = KernelInceptionDistance(subset_size=50, normalize=True).to(device)
+    models['kid_rag'] = KernelInceptionDistance(subset_size=50, normalize=True).to(device)
+    return models
 
 # --------------------------------------------------
-# --- 辅助函数：特征提取 ---
+# --- 特征提取辅助函数 ---
 # --------------------------------------------------
-
-def batch_images(images, preprocess, batch_size):
-    """ 将图像列表分批处理 """
-    for i in range(0, len(images), batch_size):
-        batch = images[i:i+batch_size]
-        processed_batch = torch.stack([preprocess(img) for img in batch])
-        yield processed_batch
-
-def get_image_features(model, images, preprocess, device, batch_size=32):
-    all_features = []
-    with torch.no_grad():
-        for image_batch in batch_images(images, preprocess, batch_size):
-            image_batch = image_batch.to(device)
-
-            model_class_name = model.__class__.__name__
-
-            if model_class_name == 'CLIP':
-                features = model.encode_image(image_batch)
-            elif 'Siglip' in model_class_name: # e.g., SiglipVisionTransformer
-                features = model.encode_image(image_batch)
-            elif 'Dino' in model_class_name: # e.g., DinoVisionTransformer
-                features = model(image_batch) # DINO V2 (torch.hub) 返回 CLS token
-            else:
-                # 备用逻辑
-                try:
-                    features = model.encode_image(image_batch)
-                except AttributeError:
-                    features = model(image_batch)
-
-            all_features.append(features.cpu())
-
-    all_features = torch.cat(all_features, dim=0)
-    all_features /= all_features.norm(dim=-1, keepdim=True)
-    return all_features
-
 def get_text_features(model, text, device, tokenizer=None):
     with torch.no_grad():
-        if tokenizer: # SigLIP
+        if tokenizer:
             tokens = tokenizer(text).to(device)
             features = model.encode_text(tokens)
-        else: # CLIP
+        else:
             tokens = clip.tokenize(text).to(device)
             features = model.encode_text(tokens)
-
         features /= features.norm(dim=-1, keepdim=True)
-    return features.cpu()
+    return features
 
-def calculate_similarity(feat1, feat2):
-    """ 计算两个归一化特征张量之间的余弦相似度 """
-    return torch.matmul(feat1, feat2.T)
+def get_image_features_batch(image_paths, model, preprocess, device, batch_size=32):
+    all_features = []
+    eval_paths = image_paths[:100]
+    for i in range(0, len(eval_paths), batch_size):
+        batch_paths = eval_paths[i:i+batch_size]
+        batch_imgs = []
+        for p in batch_paths:
+            try: img = Image.open(p).convert("RGB"); batch_imgs.append(preprocess(img))
+            except: pass
+        if not batch_imgs: continue
+        batch_tensor = torch.stack(batch_imgs).to(device)
+        with torch.no_grad():
+            model_name = model.__class__.__name__
+            if 'CLIP' == model_name: feats = model.encode_image(batch_tensor)
+            elif 'Siglip' in model_name: feats = model.encode_image(batch_tensor)
+            else: feats = model(batch_tensor)
+            all_features.append(feats)
+    if not all_features: return None
+    all_features = torch.cat(all_features, dim=0)
+    return F.normalize(all_features, dim=-1)
 
 # --------------------------------------------------
-# --- ！！！关键修复：Aircraft GT 映射函数！！！ ---
+# --- GT Map 构建 ---
 # --------------------------------------------------
-def build_aircraft_gt_map(gt_map_dir):
-    """
-    读取 Aircarft 的 'images_variant_*.txt' 文件，
-    返回一个字典 {"class_name": ["image_id_1", "image_id_2", ...]}
-    """
-    print(f"Building Aircraft GT map from: {gt_map_dir}")
+def build_gt_map(dataset_name, config):
     mapping = defaultdict(list)
-    files_to_read = [
-        "images_variant_train.txt",
-        "images_variant_val.txt",
-        "images_variant_test.txt"
-    ]
-
-    for file_name in files_to_read:
-        file_path = os.path.join(gt_map_dir, file_name)
-        if not os.path.exists(file_path):
-            print(f"Warning: Cannot find map file {file_path}. DINO scores may be inaccurate.")
-            continue
-
-        with open(file_path, 'r') as f:
+    if dataset_name == 'aircraft':
+        gt_dir = config["gt_map_files_dir"]
+        for fname in ["images_variant_train.txt", "images_variant_val.txt", "images_variant_test.txt"]:
+            fpath = os.path.join(gt_dir, fname)
+            if os.path.exists(fpath):
+                with open(fpath, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split(' ', 1)
+                        if len(parts) == 2: mapping[parts[1]].append(parts[0])
+    elif dataset_name == 'imagenet':
+        with open(config["train_list"], 'r') as f:
             for line in f:
-                parts = line.strip().split(' ', 1)
-                if len(parts) == 2:
-                    image_id, class_name = parts
-                    mapping[class_name].append(image_id)
-
-    print(f"Aircraft GT map built. Found {len(mapping)} classes.")
+                path = line.strip()
+                if path: mapping[path.split('/')[0]].append(path)
     return mapping
-# --------------------------------------------------
-# (修复结束)
-# --------------------------------------------------
-
 
 # --------------------------------------------------
-# --- 主评估逻辑 ---
+# --- 主逻辑 ---
 # --------------------------------------------------
-
 if __name__ == "__main__":
-    device = "cuda"
     config = DATASET_CONFIGS[args.dataset_name]
-
     results_dir = config["output_path"]
-    classes_txt = config["classes_txt"]
-    gt_root = args.ground_truth_root
+    gt_root = args.ground_truth_root if args.ground_truth_root else config.get("gt_root")
 
-    if not os.path.exists(gt_root):
-        print(f"Error: Ground truth root directory not found: {gt_root}")
+    if not gt_root or not os.path.exists(gt_root):
+        print(f"Error: GT root {gt_root} not found.")
         sys.exit(1)
 
-    # 1. 加载所有模型
-    clip_model, clip_preprocess = load_clip_model(device)
-    siglip_model, siglip_preprocess, siglip_tokenizer = load_siglip_model(device)
-    dino_model, dino_preprocess = load_dino_model(device)
+    models = load_models(device)
 
-    # 2. 加载类别列表 (与 imageRAG_OmniGen2.py 完全相同)
-    print(f"Loading class list from {classes_txt}...")
     all_items_to_generate = []
-    try:
-        with open(classes_txt) as f:
-            for i, line in enumerate(f.readlines()):
-                full_class_name = line.strip() # CUB: "001.Black_footed_Albatross", Aircraft: "707-320"
-                if not full_class_name: continue
+    with open(config["classes_txt"], 'r') as f:
+        for i, line in enumerate(f.readlines(), 0):
+            line = line.strip()
+            if not line: continue
+            if args.dataset_name == 'imagenet':
+                parts = line.split(':', 1)
+                all_items_to_generate.append((i, parts[1].split(',')[0].strip(), parts[0].strip()))
+            elif args.dataset_name == 'cub':
+                parts = line.split(' ', 1)
+                if len(parts) == 2:
+                    folder_name = parts[1]
+                    simple_name = folder_name.split('.', 1)[-1].replace('_', ' ')
+                    all_items_to_generate.append((i, simple_name, folder_name))
+            elif args.dataset_name == 'aircraft':
+                all_items_to_generate.append((i, line, line))
 
-                simple_name = full_class_name # 默认为 aircraft
-                if args.dataset_name == 'cub':
-                    simple_name = full_class_name.split('.', 1)[-1].replace('_', ' ')
+    gt_map = build_gt_map(args.dataset_name, config)
 
-                # (label_id, prompt_name, ground_truth_folder_name)
-                all_items_to_generate.append((i, simple_name, full_class_name))
-    except FileNotFoundError:
-        print(f"Error: Could not find class file {classes_txt}.")
-        sys.exit(1)
+    metrics_keys = ['clip', 'siglip', 'dino_v1_base', 'dino_v2_base', 'dino_v3_base']
+    baseline_scores = {k: [] for k in metrics_keys}
+    rag_scores = {k: [] for k in metrics_keys}
 
-    print(f"Found {len(all_items_to_generate)} classes to evaluate.")
+    valid_class_count = 0
 
-    # --------------------------------------------------
-    # --- ！！！关键修复：预加载 Aircraft GT 映射！！！ ---
-    # --------------------------------------------------
-    aircraft_gt_map = None
-    if args.dataset_name == 'aircraft':
-        aircraft_gt_map = build_aircraft_gt_map(config["gt_map_files_dir"])
-    # --------------------------------------------------
+    # === 诊断记录列表 ===
+    missing_baselines_list = []
+    missing_gt_list = []
 
-    # 3. 初始化分数聚合器
-    baseline_scores = {'clip': [], 'siglip': [], 'dino': []}
-    rag_scores = {'clip': [], 'siglip': [], 'dino': []}
+    print(f"\n--- Starting Evaluation for {args.dataset_name} ---")
+    print(f"Target Total Classes: {len(all_items_to_generate)}")
 
-    # 4. 遍历所有类别
-    for label_id, simple_name, full_class_name in tqdm(all_items_to_generate, desc="Evaluating classes"):
+    for label_id, simple_name, lookup_key in tqdm(all_items_to_generate):
+        prompt = f"a photo of a {simple_name}"
 
-        current_prompt = f"a photo of a {simple_name}"
-        safe_class_name = simple_name.replace(' ', '_').replace('/', '_')
-        current_out_name = f"{label_id:03d}_{safe_class_name}"
+        # --- Step 1: 寻找 Baseline 图片 (No RAG) ---
+        search_pattern = os.path.join(results_dir, f"{label_id:03d}_*_no_imageRAG.png")
+        found_baselines = glob.glob(search_pattern)
 
-        # --- A. 查找生成的图像 ---
-        baseline_img_path = os.path.join(results_dir, f"{current_out_name}_no_imageRAG.png")
-        rag_img_glob = os.path.join(results_dir, f"{current_out_name}_gs_*.png")
-        rag_files_found = glob.glob(rag_img_glob)
-
-        if not os.path.exists(baseline_img_path):
-            # (打印一次警告，然后继续)
-            if label_id < 5: # 仅打印前几个错误
-                 print(f"\n[Skip] Missing baseline image: {baseline_img_path}")
-            continue
-        if not rag_files_found:
-            if label_id < 5:
-                 print(f"\n[Skip] Missing RAG image (glob failed): {rag_img_glob}")
+        if not found_baselines:
+            # [DIAGNOSTIC] 记录缺失的 Baseline
+            missing_baselines_list.append(f"ID {label_id:03d}: {simple_name}")
+            # print(f"[DEBUG MISSING BASELINE] ID {label_id:03d}") # 保持进度条整洁，最后统一打印
             continue
 
-        rag_img_path = rag_files_found[0]
+        baseline_path = found_baselines[0]
 
-        # --------------------------------------------------
-        # --- ！！！关键修复：动态 GT 路径加载！！！ ---
-        # --------------------------------------------------
-        gt_image_paths = []
-        if args.dataset_name == 'cub':
-            gt_class_dir = os.path.join(gt_root, full_class_name)
-            if not os.path.exists(gt_class_dir):
-                if label_id < 5:
-                    print(f"\n[Skip] Missing CUB Ground Truth directory: {gt_class_dir}")
-                continue
-            gt_image_paths = [os.path.join(gt_class_dir, f) for f in os.listdir(gt_class_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
+        # --- Step 2: 寻找 RAG 图片 (Fallback Logic) ---
+        base_filename = os.path.basename(baseline_path)
+        file_prefix = base_filename.replace("_no_imageRAG.png", "")
+        rag_pattern = os.path.join(results_dir, f"{file_prefix}_gs_*.png")
+        rag_candidates = glob.glob(rag_pattern)
 
+        final_rag_path = rag_candidates[0] if rag_candidates else baseline_path
+
+        # --- Step 3: 获取 GT 图片列表 ---
+        gt_paths = []
+        if args.dataset_name == 'imagenet':
+            rel_paths = gt_map.get(lookup_key, [])
+            gt_paths = [os.path.join(gt_root, p) for p in rel_paths]
         elif args.dataset_name == 'aircraft':
-            if aircraft_gt_map and full_class_name in aircraft_gt_map:
-                image_ids = aircraft_gt_map[full_class_name]
-                # gt_root 此时是 '.../data/images'
-                gt_image_paths = [os.path.join(gt_root, f"{img_id}.jpg") for img_id in image_ids]
-            else:
-                if label_id < 5:
-                    print(f"\n[Skip] Class '{full_class_name}' not found in Aircraft GT map.")
-                continue
-        # --------------------------------------------------
+            ids = gt_map.get(lookup_key, [])
+            gt_paths = [os.path.join(gt_root, f"{id}.jpg") for id in ids]
+        elif args.dataset_name == 'cub':
+            gt_dir = os.path.join(gt_root, lookup_key)
+            if os.path.exists(gt_dir):
+                gt_paths = [os.path.join(gt_dir, f) for f in os.listdir(gt_dir) if f.endswith(('.jpg', '.png'))]
 
+        gt_paths = [p for p in gt_paths if os.path.exists(p)]
+
+        if not gt_paths:
+            # [DIAGNOSTIC] 记录缺失的 GT
+            missing_gt_list.append(f"ID {label_id:03d}: {lookup_key}")
+            continue
+
+        valid_class_count += 1
+
+        # --- Step 4: 提取特征和计算分数 ---
         try:
-            if not gt_image_paths:
-                if label_id < 5:
-                    print(f"\n[Skip] No GT images found for class: {full_class_name}")
+            clip_t = get_text_features(models['clip'], [prompt], device)
+            siglip_t = get_text_features(models['siglip'], [prompt], device, models['siglip_tokenizer'])
+
+            gt_v1 = get_image_features_batch(gt_paths, models['dino_v1'], models['dino_preprocess'], device)
+            gt_v2 = get_image_features_batch(gt_paths, models['dino_v2'], models['dino_preprocess'], device)
+            gt_v3 = get_image_features_batch(gt_paths, models['dino_v3'], models['dino_preprocess'], device)
+
+            if any(x is None for x in [gt_v1, gt_v2, gt_v3]):
+                print(f"[Feature Error] ID {label_id:03d} feature extraction failed.")
                 continue
 
-            baseline_pil = Image.open(baseline_img_path).convert("RGB")
-            rag_pil = Image.open(rag_img_path).convert("RGB")
-            gt_pils = [Image.open(p).convert("RGB") for p in gt_image_paths]
+            base_pil = Image.open(baseline_path).convert("RGB")
+            rag_pil = Image.open(final_rag_path).convert("RGB")
+
+            # KID
+            import random
+            kid_real_samples = random.sample(gt_paths, min(len(gt_paths), 50))
+            kid_real_imgs = [models['kid_transform'](Image.open(p).convert("RGB")) for p in kid_real_samples]
+            if kid_real_imgs:
+                kid_real_tensor = torch.stack(kid_real_imgs).to(device)
+                models['kid_baseline'].update(kid_real_tensor, real=True)
+                models['kid_rag'].update(kid_real_tensor, real=True)
+
+            base_tensor_kid = models['kid_transform'](base_pil).unsqueeze(0).to(device)
+            rag_tensor_kid = models['kid_transform'](rag_pil).unsqueeze(0).to(device)
+            models['kid_baseline'].update(base_tensor_kid, real=False)
+            models['kid_rag'].update(rag_tensor_kid, real=False)
+
+            # Features
+            dino_in_base = models['dino_preprocess'](base_pil).unsqueeze(0).to(device)
+            dino_in_rag = models['dino_preprocess'](rag_pil).unsqueeze(0).to(device)
+            clip_in_base = models['clip_preprocess'](base_pil).unsqueeze(0).to(device)
+            clip_in_rag = models['clip_preprocess'](rag_pil).unsqueeze(0).to(device)
+            sig_in_base = models['siglip_preprocess'](base_pil).unsqueeze(0).to(device)
+            sig_in_rag = models['siglip_preprocess'](rag_pil).unsqueeze(0).to(device)
+
+            # Scoring
+            base_clip = models['clip'].encode_image(clip_in_base)
+            base_clip /= base_clip.norm(dim=-1, keepdim=True)
+            rag_clip = models['clip'].encode_image(clip_in_rag)
+            rag_clip /= rag_clip.norm(dim=-1, keepdim=True)
+            baseline_scores['clip'].append((base_clip @ clip_t.T).item())
+            rag_scores['clip'].append((rag_clip @ clip_t.T).item())
+
+            base_sig = F.normalize(models['siglip'].encode_image(sig_in_base), dim=-1)
+            rag_sig = F.normalize(models['siglip'].encode_image(sig_in_rag), dim=-1)
+            baseline_scores['siglip'].append((base_sig @ siglip_t.T).item())
+            rag_scores['siglip'].append((rag_sig @ siglip_t.T).item())
+
+            base_v1 = F.normalize(models['dino_v1'](dino_in_base), dim=-1)
+            rag_v1 = F.normalize(models['dino_v1'](dino_in_rag), dim=-1)
+            baseline_scores['dino_v1_base'].append((base_v1 @ gt_v1.T).mean().item())
+            rag_scores['dino_v1_base'].append((rag_v1 @ gt_v1.T).mean().item())
+
+            base_v2 = F.normalize(models['dino_v2'](dino_in_base), dim=-1)
+            rag_v2 = F.normalize(models['dino_v2'](dino_in_rag), dim=-1)
+            baseline_scores['dino_v2_base'].append((base_v2 @ gt_v2.T).mean().item())
+            rag_scores['dino_v2_base'].append((rag_v2 @ gt_v2.T).mean().item())
+
+            base_v3 = F.normalize(models['dino_v3'](dino_in_base), dim=-1)
+            rag_v3 = F.normalize(models['dino_v3'](dino_in_rag), dim=-1)
+            baseline_scores['dino_v3_base'].append((base_v3 @ gt_v3.T).mean().item())
+            rag_scores['dino_v3_base'].append((rag_v3 @ gt_v3.T).mean().item())
 
         except Exception as e:
-            print(f"\n[Error] Failed to load images for {current_out_name}: {e}")
-            continue
+            print(f"Error processing {simple_name}: {e}")
 
-        # --- C. 计算特征 ---
+    print("Calculating Final KID Scores...")
+    try:
+        kid_base_mean, _ = models['kid_baseline'].compute()
+        kid_rag_mean, _ = models['kid_rag'].compute()
+    except:
+        kid_base_mean = torch.tensor(0.0); kid_rag_mean = torch.tensor(0.0)
 
-        # 文本特征 (T-Feats)
-        clip_t_feat = get_text_features(clip_model, [current_prompt], device)
-        siglip_t_feat = get_text_features(siglip_model, [current_prompt], device, siglip_tokenizer)
+    print("\n\n" + "="*60)
+    print(f"  EVALUATION RESULTS: {args.dataset_name} (All ViT-Base)")
+    print(f"  Classes Evaluated: {len(baseline_scores['clip'])} / {len(all_items_to_generate)}")
+    print("="*60)
 
-        # Ground Truth 图像特征 (GT-I-Feats)
-        gt_clip_i_feats = get_image_features(clip_model, gt_pils, clip_preprocess, device, args.batch_size)
-        gt_siglip_i_feats = get_image_features(siglip_model, gt_pils, siglip_preprocess, device, args.batch_size)
-        gt_dino_i_feats = get_image_features(dino_model, gt_pils, dino_preprocess, device, args.batch_size)
+    # --- 打印缺失列表 ---
+    if missing_baselines_list:
+        print("\n[WARNING] The following classes are MISSING generated images (no_imageRAG):")
+        for item in missing_baselines_list:
+            print(f"  - {item}")
+        print("  -> Solution: Please run the generation script for these specific IDs.")
 
-        # 平均 GT 特征
-        gt_clip_i_feat_avg = torch.mean(gt_clip_i_feats, dim=0, keepdim=True)
-        gt_siglip_i_feat_avg = torch.mean(gt_siglip_i_feats, dim=0, keepdim=True)
-        gt_dino_i_feat_avg = torch.mean(gt_dino_i_feats, dim=0, keepdim=True)
+    if missing_gt_list:
+        print("\n[WARNING] The following classes are MISSING Ground Truth images:")
+        for item in missing_gt_list:
+            print(f"  - {item}")
+        print("  -> Solution: Check your CUB dataset path or classes.txt mapping.")
 
-        # Baseline 图像特征 (Gen-I-Feats)
-        baseline_clip_i_feat = get_image_features(clip_model, [baseline_pil], clip_preprocess, device)
-        baseline_siglip_i_feat = get_image_features(siglip_model, [baseline_pil], siglip_preprocess, device)
-        baseline_dino_i_feat = get_image_features(dino_model, [baseline_pil], dino_preprocess, device)
-
-        # RAG 图像特征
-        rag_clip_i_feat = get_image_features(clip_model, [rag_pil], clip_preprocess, device)
-        rag_siglip_i_feat = get_image_features(siglip_model, [rag_pil], siglip_preprocess, device)
-        rag_dino_i_feat = get_image_features(dino_model, [rag_pil], dino_preprocess, device)
-
-        # --- D. 计算分数并聚合 ---
-
-        # Baseline 分数
-        baseline_scores['clip'].append(calculate_similarity(clip_t_feat, baseline_clip_i_feat).item())
-        baseline_scores['siglip'].append(calculate_similarity(siglip_t_feat, baseline_siglip_i_feat).item())
-        baseline_scores['dino'].append(calculate_similarity(gt_dino_i_feat_avg, baseline_dino_i_feat).item())
-
-        # RAG 分数
-        rag_scores['clip'].append(calculate_similarity(clip_t_feat, rag_clip_i_feat).item())
-        rag_scores['siglip'].append(calculate_similarity(siglip_t_feat, rag_siglip_i_feat).item())
-        rag_scores['dino'].append(calculate_similarity(gt_dino_i_feat_avg, rag_dino_i_feat).item())
-
-    # --- 5. 打印最终结果 ---
-
-    print("\n\n" + "="*30)
-    print(f"  EVALUATION RESULTS: {args.dataset_name}")
-    print(f"  (Evaluated {len(baseline_scores['clip'])} / {len(all_items_to_generate)} total classes)")
-    print("="*30)
-
-    print(f"\n--- Baseline (No RAG) ---")
-    for metric, values in baseline_scores.items():
-        if values:
-            print(f"{metric.upper()} Score : \t {np.mean(values):.4f}")
+    def print_metrics(name, scores, kid_val):
+        print(f"\n--- {name} ---")
+        if scores['clip']:
+            print(f"{'CLIP':<12}: {np.mean(scores['clip']):.4f}")
+            print(f"{'SigLIP':<12}: {np.mean(scores['siglip']):.4f}")
+            print(f"{'DINOv1_B':<12}: {np.mean(scores['dino_v1_base']):.4f}")
+            print(f"{'DINOv2_B':<12}: {np.mean(scores['dino_v2_base']):.4f}")
+            print(f"{'DINOv3_B':<12}: {np.mean(scores['dino_v3_base']):.4f}")
+            print(f"{'KID':<12}: {kid_val.item():.6f} (Lower is better)")
         else:
-            print(f"{metric.upper()} Score : \t N/A")
+            print("No data.")
 
-    print(f"\n--- RAG Assisted (Old) ---")
-    for metric, values in rag_scores.items():
-        if values:
-            print(f"{metric.upper()} Score : \t {np.mean(values):.4f}")
-        else:
-            print(f"{metric.upper()} Score : \t N/A")
-
-    print("="*30)
+    print_metrics("Baseline (No RAG)", baseline_scores, kid_base_mean)
+    print_metrics("RAG Assisted (Old - Final)", rag_scores, kid_rag_mean)
+    print("="*60)

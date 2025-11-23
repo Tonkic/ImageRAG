@@ -7,7 +7,6 @@ from PIL import Image
 import numpy as np
 
 # (为简洁起见，省略了 message_gpt, rerank_BM25, gpt_rerank, retrieve_from_small_set)
-# (您需要从您上传的 retrieval.py 中保留它们)
 
 def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:1'):
     """
