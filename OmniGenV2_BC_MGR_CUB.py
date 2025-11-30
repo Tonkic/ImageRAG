@@ -54,8 +54,7 @@ import clip
 
 # ------------------------------------------------------------------
 from binary_critic import retrieval_caption_generation  # Critic
-from memory_guided_retrieval import retrieve_img_per_caption # Retrieval
-from global_memory import GlobalMemory # [Added] Global Memory Logic
+from memory_guided_retrieval import retrieve_img_per_caption, GlobalMemory # Retrieval
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -171,13 +170,6 @@ if __name__ == "__main__":
     # retrieval_db = load_retrieval_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
-    # [Added] Initialize Global Memory
-    memory = GlobalMemory(
-        memory_file="global_memory_cub.json",
-        model_path="global_memory_cub.pth",
-        device="cuda"
-    )
-
     # 加载类别列表
     with open(DATASET_CONFIG['classes_txt'], 'r') as f:
         all_classes = [line.strip() for line in f.readlines() if line.strip()]
@@ -224,7 +216,7 @@ if __name__ == "__main__":
 
         current_image = v1_path
         retry_cnt = 0
-        exclusion_list = []
+        global_memory = GlobalMemory()
 
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
@@ -247,61 +239,24 @@ if __name__ == "__main__":
 
             # 2. Retrieval (MGR)
             # [关键修复] static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
+            # [Fix] Use device="cpu" to avoid OOM
+            retrieved_lists, _ = retrieve_img_per_caption(
+                [prompt], retrieval_db,
+                embeddings_path=args.embeddings_path,
+                k=50, device="cpu",
+                global_memory=global_memory
+            )
+
             # 获取第一个 prompt 的候选列表 (retrieved_lists[0] 是路径列表)
             candidates = retrieved_lists[0]
 
-            # [Modified] Global Memory Re-ranking
-            best_ref = None
-            best_mem_score = -1.0
-
-            # Check top candidates with Global Memory
-            checked_count = 0
-            for cand in candidates:
-                if cand in exclusion_list: continue
-
-                # Predict score using the trained memory model
-                mem_score = memory.predict_score(cand, prompt)
-
-                if mem_score > best_mem_score:
-                    best_mem_score = mem_score
-                    best_ref = cand
-
-                checked_count += 1
-                if checked_count >= 10: break
-
-            # Fallback
-            if not best_ref:
-                 for cand in candidates:
-                    if cand not in exclusion_list:
-                        best_ref = cand
-                        break
-
-            if best_ref:
-            current_image = next_path
-            retry_cnt += 1
-
-            # [Added] Record Feedback (Binary Critic)
-            if best_ref:
-                memory.add_feedback(
-                    image_path=best_ref,
-                    prompt=prompt,
-                    is_match=False # Failed attempt
-                )
-
-        # [Added] Periodic Training
-        if (my_classes.index(class_name) + 1) % 5 == 0:
-            print(f"  >> Training Global Memory Model...")
-            memory.train_model(epochs=5)
-
-        f_log.close()
-
-            f_log.write(f">> Ref: {best_ref} (MemScore: {best_mem_score:.4f})\n")
-
-            # 3. Generation
-
-            if not best_ref:
+            if not candidates:
                 f_log.write(">> No new references found in candidates.\n")
                 break
+
+            best_ref = candidates[0]
+            global_memory.add(best_ref)
+
             f_log.write(f">> Ref: {best_ref}\n")
 
             # 3. Generation

@@ -169,10 +169,52 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
     return top_paths, top_scores
 
 
-def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP'):
+class GlobalMemory:
+    """
+    Global Memory for tracking retrieval history and re-ranking.
+    Currently implements a 'Taboo' mechanism to penalize previously used images.
+    """
+    def __init__(self):
+        self.history = set()
+
+    def add(self, path):
+        self.history.add(path)
+
+    def __contains__(self, path):
+        return path in self.history
+
+    def re_rank(self, paths, scores, penalty=100.0):
+        """
+        Re-rank paths/scores by penalizing items in history.
+        """
+        new_paths = []
+        new_scores = []
+
+        # Combine and sort
+        combined = list(zip(paths, scores))
+
+        # Apply penalty
+        penalized = []
+        for p, s in combined:
+            if p in self.history:
+                s -= penalty
+            penalized.append((p, s))
+
+        # Re-sort descending
+        penalized.sort(key=lambda x: x[1], reverse=True)
+
+        # Unzip
+        if penalized:
+            new_paths, new_scores = zip(*penalized)
+            return list(new_paths), list(new_scores)
+        return [], []
+
+
+def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None):
     """
     统一检索入口。
     支持 method: 'CLIP', 'SigLIP', 'Hybrid' (RRF Fusion)
+    支持 global_memory: 用于 Re-ranking (Penalize history)
     """
     all_retrieved_paths = []
     all_retrieved_scores = []
@@ -210,12 +252,20 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
 
             # Sort by RRF score
             sorted_paths = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-            sorted_paths = sorted_paths[:k]
 
-            # Normalize scores for compatibility (just use RRF score or max of original?)
-            # For simplicity, we return the RRF score, but scaled to look like a similarity (0-1)
-            # Max RRF is approx 1/60 + 1/60 = 0.033. Let's scale by 30 to get ~1.0
-            final_scores = [rrf_scores[p] * 30.0 for p in sorted_paths]
+            # [Global Memory Re-ranking]
+            # Apply before truncation to k, to allow lower-ranked items to bubble up if top ones are penalized
+            if global_memory:
+                # Convert RRF scores to list for re-ranking
+                temp_scores = [rrf_scores[p] * 30.0 for p in sorted_paths]
+                sorted_paths, temp_scores = global_memory.re_rank(sorted_paths, temp_scores)
+                # Update final scores map for the truncated list
+                # (Actually we just need the sorted list and scores)
+                final_scores = temp_scores[:k]
+                sorted_paths = sorted_paths[:k]
+            else:
+                sorted_paths = sorted_paths[:k]
+                final_scores = [rrf_scores[p] * 30.0 for p in sorted_paths]
 
             all_retrieved_paths.append(sorted_paths)
             all_retrieved_scores.append(final_scores)
@@ -226,6 +276,10 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 embeddings_path=embeddings_path,
                 k=k, device=device
             )
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
@@ -235,6 +289,10 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 embeddings_path=embeddings_path,
                 k=k, device=device, save=True
             )
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
@@ -245,6 +303,10 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 embeddings_path=embeddings_path,
                 k=k, device=device
             )
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 

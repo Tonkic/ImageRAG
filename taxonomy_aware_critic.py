@@ -1,36 +1,5 @@
 import json
-import base64
-import io
-from PIL import Image
-
-def encode_image(image_path):
-    try:
-        image = Image.open(image_path)
-        if image.mode in ('RGBA', 'P'):
-            image = image.convert('RGB')
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
-        image_bytes = buffer.getvalue()
-        return base64.b64encode(image_bytes).decode('utf-8')
-    except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
-        return None
-
-def message_gpt_internal(msg, client, image_paths=[], model="gpt-4o", temperature=0):
-    messages = [{"role": "user", "content": [{"type": "text", "text": msg}]}]
-    if image_paths:
-        base_64_images = [encode_image(p) for p in image_paths]
-        for img in base_64_images:
-            if img:
-                messages[0]["content"].append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img}"}
-                })
-    res = client.chat.completions.create(
-        model=model, messages=messages,
-        response_format={"type": "text"}, temperature=temperature
-    )
-    return res.choices[0].message.content
+from utils import message_gpt
 
 def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model):
     """
@@ -63,23 +32,18 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model):
 
     ### 4. Features Extraction:
     - "features": A list of specific visual elements that are MISSING or WRONG.
-    - **IMPORTANT**: Keep descriptions extremely concise (1-4 words max). Limit to top 3 most critical features to avoid token overflow.
-
-    ### 5. Correction (Optional):
-    - "correction": If "wrong_concept" or "attribute_binding_error", specify what the object ACTUALLY looks like or what class it belongs to (e.g., "It is a 707-200, not 707-320").
 
     Example JSON:
     {{
         "status": "error",
         "score": 4,
-        "error_type": "wrong_concept",
-        "critique": "This is a Boeing 707-200, but the prompt asked for a 707-320.",
-        "features": ["wrong aircraft variant"],
-        "correction": "707-200"
+        "error_type": "role_binding_error",
+        "critique": "The astronaut is riding the horse, but the prompt asked for the horse to ride the astronaut.",
+        "features": ["astronaut riding horse"]
     }}
     """
 
-    ans_text = message_gpt_internal(msg, gpt_client, image_paths, model=model)
+    ans_text = message_gpt(msg, gpt_client, image_paths, model=model, images_idx=0)
 
     try:
         if "```json" in ans_text:

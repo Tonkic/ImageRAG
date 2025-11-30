@@ -59,8 +59,7 @@ import clip
 
 # [IMPORTS] Custom Modules
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # TAC Logic
-from memory_guided_retrieval import retrieve_img_per_caption # MGR Logic
-from global_memory import GlobalMemory # [Added] Global Memory Logic
+from memory_guided_retrieval import retrieve_img_per_caption, GlobalMemory # MGR Logic
 
 # --- 2. Reproducibility (Seed Fix) ---
 def seed_everything(seed):
@@ -186,13 +185,6 @@ if __name__ == "__main__":
     # retrieval_db = load_retrieval_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
-    # [Added] Initialize Global Memory
-    memory = GlobalMemory(
-        memory_file="global_memory_cub.json",
-        model_path="global_memory_cub.pth",
-        device="cuda"
-    )
-
     # 3. Load Tasks
     with open(DATASET_CONFIG['classes_txt'], 'r') as f:
         all_classes = [line.strip() for line in f.readlines() if line.strip()]
@@ -238,8 +230,8 @@ if __name__ == "__main__":
         current_image = v1_path
         retry_cnt = 0
 
-        # [MGR Core]: Exclusion List to avoid bad references
-        exclusion_list = []
+        # [MGR Core]: Global Memory for Re-ranking
+        global_memory = GlobalMemory()
 
         # [Score Tracking]
         best_score = -1
@@ -273,13 +265,21 @@ if __name__ == "__main__":
             # Query = Prompt + Features detected by TAC
             feature_text = ", ".join(features) if features else ""
             query = f"{prompt}. {feature_text}"
+
+            # [FIX] Truncate query to avoid CLIP context length overflow (77 tokens)
+            if len(query) > 300:
+                query = f"{prompt}. {feature_text[:200]}..."
+
+            f_log.write(f"Query: {query}\n")
+
             # [Optimization] Use Hybrid Retrieval (CLIP + SigLIP) for better 1-shot performance
             # [Fix] Use device="cpu" to avoid OOM, relying on pre-calculated embeddings
             try:
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cpu", method='Hybrid'
+                    k=50, device="cpu", method='Hybrid',
+                    global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
                 candidate_scores = retrieved_scores[0]
@@ -289,43 +289,22 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cpu", method='Hybrid'
+                    k=50, device="cpu", method='Hybrid',
+                    global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
                 candidate_scores = retrieved_scores[0]
 
-            # [Modified] Global Memory Re-ranking
-            best_ref = None
-            best_mem_score = -1.0
-
-            # Check top candidates with Global Memory
-            checked_count = 0
-            for i, cand in enumerate(candidates):
-                if cand in exclusion_list: continue
-
-                # Predict score using the trained memory model
-                mem_score = memory.predict_score(cand, query)
-
-                if mem_score > best_mem_score:
-                    best_mem_score = mem_score
-                    best_ref = cand
-
-                checked_count += 1
-                if checked_count >= 10: break
-
-            # Fallback
-            if not best_ref:
-                 for i, cand in enumerate(candidates):
-                    if cand not in exclusion_list:
-                        best_ref = cand
-                        best_mem_score = min(1.0, candidate_scores[i] / 2.0)
-                        break
-
-            if best_ref:
-                exclusion_list.append(best_ref)
-            else:
+            # Select best candidate (Top-1 after Re-ranking)
+            if not candidates:
                 f_log.write(">> Memory Exhausted (No new unique references found).\n")
                 break
+
+            best_ref = candidates[0]
+            best_ref_score = candidate_scores[0]
+
+            # Add to Global Memory
+            global_memory.add(best_ref)
 
             # [Adaptive Guidance Scale]
             # Heuristic: If similarity score is high (>0.3), trust the reference more (scale up to 3.5).
@@ -334,12 +313,6 @@ if __name__ == "__main__":
             # Formula: scale = 1.0 + (score * 8.0) clamped to [2.0, 4.0]
             # Example: 0.25 * 8 = 2.0 + 1.0 = 3.0
             # Example: 0.30 * 8 = 2.4 + 1.0 = 3.4
-            adaptive_scale = 2.0 + (best_mem_score * 3.0)
-            adaptive_scale = max(2.5, min(adaptive_scale, 4.5))
-
-            f_log.write(f">> Ref: {best_ref} (MemScore: {best_mem_score:.4f}) -> Adaptive Scale: {adaptive_scale:.2f}\n")
-
-            # C. Dynamic Dispatch & Composition.4
             adaptive_scale = 2.0 + (best_ref_score * 5.0)
             adaptive_scale = max(2.5, min(adaptive_scale, 4.5))
 
@@ -348,39 +321,23 @@ if __name__ == "__main__":
 
             # C. Dynamic Dispatch & Composition
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
-        # Final Check for the last generated image if loop finished without success
-        if not os.path.exists(final_success_path):
-            f_log.write(f"\n--- Final Check (Last Generated) ---\n")
-            # Evaluate the last image generated (current_image)
-            if os.path.exists(current_image):
-                diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
-                score = diagnosis.get('score', 0)
-                f_log.write(f"Final Image Score: {score}\n")
-                if score > best_score:
-                    best_score = score
-                    best_image_path = current_image
 
-                # [Added] Record Feedback
-                is_match = (diagnosis['status'] == 'success')
-                correction = diagnosis.get('correction', None)
-                if best_ref:
-                    memory.add_feedback(
-                        image_path=best_ref,
-                        prompt=query,
-                        actual_label=correction,
-                        is_match=is_match
-                    )
+            # Construct correction instruction with features if available
+            correction_instruction = f"{error_type}: {feature_text}" if feature_text else error_type
 
-            f_log.write(f">> Loop finished. Best Score: {best_score}. Saving best image to FINAL.\n")
-            if best_image_path and os.path.exists(best_image_path):
-                shutil.copy(best_image_path, final_success_path)
+            # Logic: Use Regen for compositional/concept errors; Edit for others
+            if error_type in ["role_binding_error", "attribute_binding_error", "spatial_relation_error", "wrong_concept", "missing_object"]:
+                regen_prompt = f"{prompt}. Correct the {correction_instruction}. Use <|image_1|> as a visual reference."
+                f_log.write(f"Regen Prompt: {regen_prompt}\n")
+                run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=adaptive_scale)
+            else:
+                edit_prompt = f"Edit this image to fix {correction_instruction}. Reference style: <|image_1|>"
+                f_log.write(f"Edit Prompt: {edit_prompt}\n")
+                # For Edit, we usually want stronger guidance, so we boost the adaptive scale slightly
+                edit_scale = max(2.5, adaptive_scale)
+                run_omnigen(pipe, edit_prompt, [current_image, best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=edit_scale)
 
-        # [Added] Periodic Training
-        if (my_classes.index(class_name) + 1) % 5 == 0:
-            print(f"  >> Training Global Memory Model...")
-            memory.train_model(epochs=5)
-
-        f_log.close()mage = next_path
+            current_image = next_path
             retry_cnt += 1
 
         # Final Check for the last generated image if loop finished without success
