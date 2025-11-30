@@ -1,5 +1,5 @@
 '''
-Evaluation Script for Aircraft (All Methods)
+Evaluation Script for ImageNet (All Methods)
 =======================================================
 Methods Evaluated:
   1. Baseline (V1) - Shared
@@ -35,7 +35,7 @@ from torchmetrics.image.kid import KernelInceptionDistance
 # --------------------------------------------------
 # --- 1. Args ---
 # --------------------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate Aircraft (All Methods)")
+parser = argparse.ArgumentParser(description="Evaluate ImageNet (All Methods)")
 parser.add_argument("--device_id", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
@@ -51,17 +51,16 @@ print(f"Using device: {device}")
 # --- Config ---
 # --------------------------------------------------
 DATASET_CONFIG = {
-    "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
-    "real_images_list": "datasets/fgvc-aircraft-2013b/data/images_variant_test.txt",
-    "real_images_root": "datasets/fgvc-aircraft-2013b/data/images",
+    "classes_txt": "datasets/imagenet_classes.txt",
+    "real_images_root": "datasets/ILSVRC2012_train",
 }
 
 METHODS = {
-    "Baseline": "results/OmniGenV2_Baseline_Aircraft",
-    "BC_SR": "results/OmniGenV2_BC_SR_Aircraft",
-    "BC_MGR": "results/OmniGenV2_BC_MGR_Aircraft",
-    "TAC_SR": "results/OmniGenV2_TAC_SR_Aircraft",
-    "TAC_MGR": "results/OmniGenV2_TAC_MGR_Aircraft"
+    "Baseline": "results/OmniGenV2_Baseline_ImageNet",
+    "BC_SR": "results/OmniGenV2_BC_SR_ImageNet",
+    "BC_MGR": "results/OmniGenV2_BC_MGR_ImageNet",
+    "TAC_SR": "results/OmniGenV2_TAC_SR_ImageNet",
+    "TAC_MGR": "results/OmniGenV2_TAC_MGR_ImageNet"
 }
 
 # --------------------------------------------------
@@ -115,8 +114,7 @@ def load_models(device):
     print("Initializing KID...")
     models['kid'] = {}
     for m in METHODS.keys():
-        # Reduced subset_size to 5 to allow calculation with fewer samples
-        models['kid'][m] = KernelInceptionDistance(subset_size=5, normalize=True).to(device)
+        models['kid'][m] = KernelInceptionDistance(subset_size=25, normalize=True).to(device)
 
     models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
 
@@ -125,34 +123,36 @@ def load_models(device):
 # --------------------------------------------------
 # --- 3. Data Loader ---
 # --------------------------------------------------
-def load_aircraft_tasks(config):
-    print("Loading Aircraft Task List...")
+def load_imagenet_tasks(config):
+    print("Loading ImageNet Task List...")
     tasks = []
-    class_map = {}
 
+    class_info = {}
     with open(config['classes_txt']) as f:
-        for i, l in enumerate(f):
-            if l.strip(): class_map[l.strip()] = i
+        for line in f:
+            parts = line.strip().split(':', 1)
+            if len(parts) < 2: continue
+            nid = parts[0].strip()
+            names = parts[1].strip()
+            simple_name = names.split(',')[0].strip()
+            class_info[nid] = simple_name
 
-    real_map = defaultdict(list)
-    with open(config['real_images_list']) as f:
-        for l in f:
-            p = l.strip().split(' ', 1)
-            if len(p) == 2 and p[1] in class_map:
-                fp = os.path.join(config['real_images_root'], f"{p[0]}.jpg")
-                if os.path.exists(fp):
-                    real_map[class_map[p[1]]].append(fp)
+    for nid, simple_name in class_info.items():
+        safe_name = f"{nid}_{simple_name.replace(' ', '_').replace('/', '-')}"
 
-    id_to_name = {v: k for k, v in class_map.items()}
+        class_dir = os.path.join(config['real_images_root'], nid)
+        real_paths = []
+        if os.path.isdir(class_dir):
+             for img in os.listdir(class_dir):
+                 if img.lower().endswith(('.jpg', '.jpeg', '.png')):
+                     real_paths.append(os.path.join(class_dir, img))
 
-    for i in range(len(class_map)):
-        name = id_to_name[i]
-        safe_name = name.replace(' ', '_').replace('/', '-')
         tasks.append({
-            "prompt": f"a photo of a {name}",
-            "safe_filename_prefix": f"{safe_name}",
-            "real_image_paths": real_map[i]
+            "prompt": f"a photo of a {simple_name}",
+            "safe_filename_prefix": safe_name,
+            "real_image_paths": real_paths
         })
+
     return tasks
 
 # --------------------------------------------------
@@ -215,12 +215,12 @@ def main():
         torch.cuda.manual_seed_all(seed)
 
     models = load_models(device)
-    tasks = load_aircraft_tasks(DATASET_CONFIG)
+    tasks = load_imagenet_tasks(DATASET_CONFIG)
 
     # Storage for results
     results = {m: [] for m in METHODS.keys()}
 
-    print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
+    print(f"\nStarting evaluation on {len(tasks)} ImageNet classes...")
 
     for task in tqdm(tasks):
         # 1. Get Real Features
@@ -253,10 +253,7 @@ def main():
         if kimgs:
             kt = torch.stack(kimgs).to(device)
             for m in METHODS.keys():
-                try:
-                    models['kid'][m].update(kt, real=True)
-                except Exception as e:
-                    print(f"Warning: KID update failed for {m} (real): {e}")
+                models['kid'][m].update(kt, real=True)
 
         # 4. Evaluate Each Method
         for method_name, dir_path in METHODS.items():
@@ -278,13 +275,11 @@ def main():
                         models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device),
                         real=False
                     )
-                except Exception as e:
-                    # print(f"Warning: KID update failed for {method_name} (fake): {e}")
-                    pass
+                except: pass
 
     # Report
     print("\n" + "="*80)
-    print(f"  EVAL REPORT: Aircraft (All Methods)")
+    print(f"  EVAL REPORT: ImageNet (All Methods)")
     print("="*80)
     print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
     print("-" * 80)

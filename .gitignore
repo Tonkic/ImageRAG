@@ -9,6 +9,7 @@ datasets/
 results/
 hf_cache/
 dinov3/
+oldcode/
 ILSVRC2012_img_train.tar
 
 # Python 缓存和日志

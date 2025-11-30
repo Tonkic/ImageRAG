@@ -1,0 +1,5 @@
+Title: Taxonomy-Aware Criticism and Memory-Guided Retrieval for Robust Text-to-Image Generation
+
+Abstract
+
+Text-to-Image (T2I) models often struggle with fine-grained generation, while existing Retrieval-Augmented Generation (RAG) methods lack dynamic error correction. We propose **TAC-MGR**, a framework integrating **Taxonomy-Aware Criticism (TAC)** and **Memory-Guided Retrieval (MGR)**. TAC utilizes Vision-Language Models to diagnose structured errors beyond binary scoring, while MGR dynamically updates a global memory with this feedback to refine future retrievals. By combining hybrid retrieval (CLIP+SigLIP) with adaptive guidance, our method optimizes reference selection and influence. Experiments on FGVC-Aircraft and CUB-200-2011 demonstrate that TAC-MGR significantly outperforms baselines, achieving a CLIP score of [   ] and KID of [   ] on FGVC-Aircraft.

@@ -1,33 +1,29 @@
 '''
-Evaluation Script for Aircraft (All Methods)
+Evaluation Script for: OmniGenV2 + BC + MGR (CUB)
 =======================================================
-Methods Evaluated:
-  1. Baseline (V1) - Shared
-  2. BC + SR
-  3. BC + MGR
-  4. TAC + SR
-  5. TAC + MGR
-
 Metrics:
-  - CLIP Score
-  - SigLIP Score
-  - DINO v1/v2/v3 (Image Fidelity)
-  - KID (Kernel Inception Distance)
+  - CLIP Score (Text-Image Alignment)
+  - SigLIP Score (Better Alignment)
+  - DINO v1/v2/v3 (Image Fidelity/Quality) - All ViT-B
+  - KID (Kernel Inception Distance) - Distribution Distance
 '''
 
 import os
 import sys
 import argparse
+import re
 import random
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from collections import defaultdict
 
+# PyTorch & Vision
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 
+# Third-party
 import open_clip
 from open_clip import create_model_from_pretrained, get_tokenizer
 from torchmetrics.image.kid import KernelInceptionDistance
@@ -35,11 +31,15 @@ from torchmetrics.image.kid import KernelInceptionDistance
 # --------------------------------------------------
 # --- 1. Args ---
 # --------------------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate Aircraft (All Methods)")
+parser = argparse.ArgumentParser(description="Evaluate OmniGenV2_BC_MGR_CUB")
 parser.add_argument("--device_id", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=32)
-parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
-parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
+
+# DINOv3 Paths
+parser.add_argument("--dinov3_repo_path", type=str,
+                    default="/home/tingyu/imageRAG/dinov3")
+parser.add_argument("--dinov3_weights_path", type=str,
+                    default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
 
 args = parser.parse_args()
 
@@ -48,20 +48,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 # --------------------------------------------------
-# --- Config ---
+# --- Dataset Config ---
 # --------------------------------------------------
 DATASET_CONFIG = {
-    "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
-    "real_images_list": "datasets/fgvc-aircraft-2013b/data/images_variant_test.txt",
-    "real_images_root": "datasets/fgvc-aircraft-2013b/data/images",
-}
-
-METHODS = {
-    "Baseline": "results/OmniGenV2_Baseline_Aircraft",
-    "BC_SR": "results/OmniGenV2_BC_SR_Aircraft",
-    "BC_MGR": "results/OmniGenV2_BC_MGR_Aircraft",
-    "TAC_SR": "results/OmniGenV2_TAC_SR_Aircraft",
-    "TAC_MGR": "results/OmniGenV2_TAC_MGR_Aircraft"
+    "classes_txt": "datasets/CUB_200_2011/classes.txt",
+    "real_images_root": "datasets/CUB_200_2011/images",
+    "results_dir": "results/OmniGenV2_BC_MGR_CUB"
 }
 
 # --------------------------------------------------
@@ -111,49 +103,65 @@ def load_models(device):
     models['siglip_model'] = models['siglip_model'].eval().to(device)
     models['siglip_tokenizer'] = get_tokenizer(sig_name)
 
-    # 6. KID (One per method)
+    # 6. KID
     print("Initializing KID...")
-    models['kid'] = {}
-    for m in METHODS.keys():
-        # Reduced subset_size to 5 to allow calculation with fewer samples
-        models['kid'][m] = KernelInceptionDistance(subset_size=5, normalize=True).to(device)
-
+    # subset_size=25 allows for 100 samples (4 subsets)
+    models['kid_v1'] = KernelInceptionDistance(subset_size=25, normalize=True).to(device)
+    models['kid_final'] = KernelInceptionDistance(subset_size=25, normalize=True).to(device)
     models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
 
     return models
 
 # --------------------------------------------------
-# --- 3. Data Loader ---
+# --- 3. Data Loader (CUB Specific) ---
 # --------------------------------------------------
-def load_aircraft_tasks(config):
-    print("Loading Aircraft Task List...")
+def load_cub_tasks(config):
+    print("Loading CUB Task List...")
     tasks = []
-    class_map = {}
 
     with open(config['classes_txt']) as f:
-        for i, l in enumerate(f):
-            if l.strip(): class_map[l.strip()] = i
+        for line in f:
+            parts = line.strip().split(' ', 1)
+            if len(parts) < 2: continue
 
-    real_map = defaultdict(list)
-    with open(config['real_images_list']) as f:
-        for l in f:
-            p = l.strip().split(' ', 1)
-            if len(p) == 2 and p[1] in class_map:
-                fp = os.path.join(config['real_images_root'], f"{p[0]}.jpg")
-                if os.path.exists(fp):
-                    real_map[class_map[p[1]]].append(fp)
+            folder_name = parts[1]
+            simple_name = folder_name.split('.', 1)[-1].replace('_', ' ')
+            safe_name = simple_name.replace(" ", "_").replace("/", "-")
 
-    id_to_name = {v: k for k, v in class_map.items()}
+            class_dir = os.path.join(config['real_images_root'], folder_name)
+            real_paths = []
+            if os.path.isdir(class_dir):
+                for img in os.listdir(class_dir):
+                    if img.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        real_paths.append(os.path.join(class_dir, img))
 
-    for i in range(len(class_map)):
-        name = id_to_name[i]
-        safe_name = name.replace(' ', '_').replace('/', '-')
-        tasks.append({
-            "prompt": f"a photo of a {name}",
-            "safe_filename_prefix": f"{safe_name}",
-            "real_image_paths": real_map[i]
-        })
+            tasks.append({
+                "prompt": f"a photo of a {simple_name}",
+                "safe_filename_prefix": safe_name,
+                "real_image_paths": real_paths
+            })
     return tasks
+
+def find_generated_images(results_dir, prefix):
+    v1_path = os.path.join(results_dir, f"{prefix}_V1.png")
+    final_path = os.path.join(results_dir, f"{prefix}_FINAL.png")
+
+    if not os.path.exists(v1_path):
+        return None, None
+
+    if os.path.exists(final_path):
+        return v1_path, final_path
+
+    # Fallback: Find highest V number (up to V10)
+    best_path = v1_path
+    for i in range(2, 11):
+        p = os.path.join(results_dir, f"{prefix}_V{i}.png")
+        if os.path.exists(p):
+            best_path = p
+        else:
+            break
+
+    return v1_path, best_path
 
 # --------------------------------------------------
 # --- 4. Evaluation Logic ---
@@ -199,7 +207,7 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
             s_feat = F.normalize(s_feat, dim=-1)
             scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
     except Exception as e:
-        # print(f"Error evaluating {img_path}: {e}")
+        print(f"Error: {e}")
         return None
     return scores
 
@@ -207,6 +215,7 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
 # --- 5. Main ---
 # --------------------------------------------------
 def main():
+    # Fix Seed
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -215,14 +224,18 @@ def main():
         torch.cuda.manual_seed_all(seed)
 
     models = load_models(device)
-    tasks = load_aircraft_tasks(DATASET_CONFIG)
+    tasks = load_cub_tasks(DATASET_CONFIG)
 
-    # Storage for results
-    results = {m: [] for m in METHODS.keys()}
+    scores_base = []
+    scores_final = []
 
-    print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
+    print(f"\nStarting evaluation on {len(tasks)} CUB classes...")
 
     for task in tqdm(tasks):
+        v1_path, final_path = find_generated_images(DATASET_CONFIG['results_dir'], task["safe_filename_prefix"])
+
+        if not v1_path: continue
+
         # 1. Get Real Features
         real_paths = task["real_image_paths"]
         if not real_paths: continue
@@ -243,74 +256,64 @@ def main():
             txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
             txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
 
-        # 3. Update KID (Real) - Update ALL KID models with real data
+        # 3. Update KID (Real)
         kp = random.sample(real_paths, min(len(real_paths), 20))
         kimgs = []
         for p in kp:
             try: kimgs.append(models['kid_transform'](Image.open(p).convert("RGB")))
             except: pass
-
         if kimgs:
             kt = torch.stack(kimgs).to(device)
-            for m in METHODS.keys():
-                try:
-                    models['kid'][m].update(kt, real=True)
-                except Exception as e:
-                    print(f"Warning: KID update failed for {m} (real): {e}")
+            models['kid_v1'].update(kt, real=True)
+            models['kid_final'].update(kt, real=True)
 
-        # 4. Evaluate Each Method
-        for method_name, dir_path in METHODS.items():
-            # Determine file path
-            if method_name == "Baseline":
-                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V1.png")
-            else:
-                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_FINAL.png")
+        # 4. Eval V1
+        res_v1 = evaluate_single(v1_path, real_feats, txt_feats, models, device)
+        if res_v1:
+            scores_base.append(res_v1)
+            try:
+                models['kid_v1'].update(models['kid_transform'](Image.open(v1_path).convert("RGB")).unsqueeze(0).to(device), real=False)
+            except Exception as e:
+                print(f"Error updating KID V1: {e}")
 
-            if not os.path.exists(img_path):
-                continue
-
-            # Eval
-            res = evaluate_single(img_path, real_feats, txt_feats, models, device)
-            if res:
-                results[method_name].append(res)
-                try:
-                    models['kid'][method_name].update(
-                        models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device),
-                        real=False
-                    )
-                except Exception as e:
-                    # print(f"Warning: KID update failed for {method_name} (fake): {e}")
-                    pass
+        # 5. Eval Final
+        res_final = evaluate_single(final_path, real_feats, txt_feats, models, device)
+        if res_final:
+            scores_final.append(res_final)
+            try:
+                models['kid_final'].update(models['kid_transform'](Image.open(final_path).convert("RGB")).unsqueeze(0).to(device), real=False)
+            except Exception as e:
+                print(f"Error updating KID Final: {e}")
 
     # Report
-    print("\n" + "="*80)
-    print(f"  EVAL REPORT: Aircraft (All Methods)")
-    print("="*80)
-    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
-    print("-" * 80)
+    print("\nComputing KID...")
+    try:
+        kv1, _ = models['kid_v1'].compute()
+    except Exception as e:
+        print(f"Warning: KID (V1) computation failed: {e}")
+        kv1 = torch.tensor(0.0)
 
-    for method_name in METHODS.keys():
-        lst = results[method_name]
-        if not lst:
-            print(f"{method_name:<15} | N/A")
-            continue
+    try:
+        kfin, _ = models['kid_final'].compute()
+    except Exception as e:
+        print(f"Warning: KID (Final) computation failed: {e}")
+        kfin = torch.tensor(0.0)
 
-        # Compute KID
-        try:
-            kid_score, _ = models['kid'][method_name].compute()
-            kid_val = kid_score.item()
-        except:
-            kid_val = 0.0
+    print("\n" + "="*60)
+    print(f"  EVAL REPORT: OmniGenV2 + BC + MGR (CUB)")
+    print("="*60)
 
-        clip_s = np.mean([x['clip'] for x in lst])
-        siglip_s = np.mean([x['siglip'] for x in lst])
-        d1 = np.mean([x['dinov1_base'] for x in lst])
-        d2 = np.mean([x['dinov2_base'] for x in lst])
-        d3 = np.mean([x['dinov3_base'] for x in lst])
+    def show(name, lst, k):
+        print(f"\n--- {name} ---")
+        if not lst: return
+        metrics = ['clip', 'siglip', 'dinov1_base', 'dinov2_base', 'dinov3_base']
+        for m in metrics:
+            print(f"{m.upper():<12}: {np.mean([x[m] for x in lst]):.4f}")
+        print(f"{'KID':<12}: {k.item():.6f}")
 
-        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f}")
-
-    print("="*80)
+    show("Baseline (V1)", scores_base, kv1)
+    show("BC+MGR (Final)", scores_final, kfin)
+    print("="*60)
 
 if __name__ == "__main__":
     main()

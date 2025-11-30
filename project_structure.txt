@@ -3,7 +3,7 @@
 ============================================================
 
 📂 .//
-    📦 包含 25 个文件 (数量过多，不一一列出)
+    📦 包含 45 个文件 (数量过多，不一一列出)
     📂 CLIP/
         📂 CLIP/
             📄 .gitignore
@@ -280,8 +280,13 @@
     📂 datasets/
         📄 CUB_200_2011.tgz
         📄 ILSVRC2012_img_train.tar
+        📄 ILSVRC2012_img_val.tar
         📄 attributes.txt
+        📄 extract_synsets.py
         📄 fgvc-aircraft-2013b.tar.gz
+        📄 imagenet_classes.txt
+        📄 imagenet_train_list.txt
+        📄 imagenet_val_list.txt
         📄 jq8wuc1xnik142b4lrnlb6b.zip
         📂 CUB_200_2011/
             📄 README
@@ -303,17 +308,22 @@
         📂 ILSVRC2012_train/
             📚 包含 1001 个子目录 (数量过多，不一一列出)
             📄 ILSVRC2012_devkit_t12.tar.gz
+        📂 ILSVRC2012_val/
+            📦 包含 50001 个文件 (数量过多，不一一列出)
         📂 embeddings/
             📂 aircraft/
                 📄 clip_embeddings_b0.pt
+                📄 clip_embeddings_b1024.pt
+                📄 clip_embeddings_b2048.pt
+                📄 clip_embeddings_b3072.pt
+                📄 siglip_embeddings_b0.pt
+                📄 siglip_embeddings_b1024.pt
+                📄 siglip_embeddings_b2048.pt
+                📄 siglip_embeddings_b3072.pt
             📂 aircraft_train/
                 📄 clip_embeddings_b0.pt
             📂 cub/
-                📄 clip_embeddings_b0.pt
-                📄 clip_embeddings_b2048.pt
-                📄 clip_embeddings_b4096.pt
-                📄 clip_embeddings_b6144.pt
-                📄 clip_embeddings_b8192.pt
+                📦 包含 24 个文件 (数量过多，不一一列出)
             📂 datasets_CUB_train/
                 📄 clip_embeddings_b0.pt
                 📄 clip_embeddings_b2048.pt
@@ -321,6 +331,8 @@
                 📄 clip_embeddings_b0.pt
             📂 fgvc-aircraft-2013b/
                 📄 clip_embeddings_b0.pt
+            📂 imagenet/
+                📦 包含 626 个文件 (数量过多，不一一列出)
         📂 fgvc-aircraft-2013b/
             📄 README.html
             📄 README.md
@@ -352,6 +364,35 @@
                 📄 variants.txt
                 📂 images/
                     📦 包含 10000 个文件 (数量过多，不一一列出)
+    📂 dinov3/
+        📄 .docstr.yaml
+        📄 .gitignore
+        📄 CODE_OF_CONDUCT.md
+        📄 CONTRIBUTING.md
+        📄 DATASETS.md
+        📄 LICENSE.md
+        📄 MODEL_CARD.md
+        📄 README.md
+        📄 conda.yaml
+        📄 dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+        📄 hubconf.py
+        📄 pyproject.toml
+        📄 requirements-dev.txt
+        📄 requirements.txt
+        📄 setup.py
+        📂 .github/
+            📂 workflows/
+                📄 lint.yaml
+        📂 dinov3/
+            📚 包含 16 个子目录 (数量过多，不一一列出)
+            📄 __init__.py
+        📂 notebooks/
+            📄 dense_sparse_matching.ipynb
+            📄 dinotxt_inference.ipynb
+            📄 dinotxt_segmentation_inference.ipynb
+            📄 foreground_segmentation.ipynb
+            📄 pca.ipynb
+            📄 segmentation_tracking.ipynb
     📂 hf_cache/
         📄 hf_cache_cassiekang___cub200_dataset_default_0.0.0_3467deb402d62ce96cb098ff3a956ecc2f61438e.lock
         📂 cassiekang___cub200_dataset/
@@ -363,22 +404,26 @@
                         📄 cub200_dataset-test.arrow
                         📄 cub200_dataset-train.arrow
                         📄 dataset_info.json
+    📂 oldcode/
+        📄 evaluate_aircraft.py
+        📄 evaluate_all.py
+        📄 evaluate_cub.py
+        📄 evaluate_old_rag.py
+        📄 evaluate_pre_rag.py
+        📄 evaluate_smart_rag.py
+        📄 generate_embeddings.py
+        📄 imageRAG_OmniGen.py
+        📄 imageRAG_OmniGen2.py
+        📄 retrieval.py
+        📄 retrieval_old.py
+        📄 run_cub.py
+        📄 run_edit_cub.py
+        📄 run_edit_fgvc-aircraft.py
+        📄 run_fgvc-aircraft.py
+        📄 run_omnigen2_t2i_example.py
+        📄 run_pre_rag_generation.py
+        📄 smart_rag_dispatcher.py
+        📄 utils.py
+        📄 utils_old.py
     📂 results/
-        📂 Aircraft/
-            📦 包含 294 个文件 (数量过多，不一一列出)
-        📂 Aircraft_OmniGen2_LoRA/
-            📦 包含 287 个文件 (数量过多，不一一列出)
-        📂 Aircraft_QwenEdit/
-            📄 000_707-320.txt
-        📂 Aircraft_SmartRAG/
-            📦 包含 332 个文件 (数量过多，不一一列出)
-        📂 Aircraft_SmartRAG_old_retrieval/
-            📦 包含 228 个文件 (数量过多，不一一列出)
-        📂 CUB/
-            📦 包含 576 个文件 (数量过多，不一一列出)
-        📂 CUB_OmniGen2_LoRA/
-            📦 包含 567 个文件 (数量过多，不一一列出)
-        📂 CUB_SmartRAG/
-            📦 包含 592 个文件 (数量过多，不一一列出)
-        📂 PreRAG/
-            📦 包含 534 个文件 (数量过多，不一一列出)
+        📚 包含 20 个子目录 (数量过多，不一一列出)

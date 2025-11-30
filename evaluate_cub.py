@@ -1,189 +1,306 @@
+'''
+Evaluation Script for CUB (All Methods)
+=======================================================
+Methods Evaluated:
+  1. Baseline (V1) - Shared
+  2. BC + SR
+  3. BC + MGR
+  4. TAC + SR
+  5. TAC + MGR
+
+Metrics:
+  - CLIP Score
+  - SigLIP Score
+  - DINO v1/v2/v3 (Image Fidelity)
+  - KID (Kernel Inception Distance)
+'''
+
 import os
-import torch
-import torch.nn.functional as F
-from PIL import Image
-from tqdm import tqdm
-import open_clip
-from open_clip import create_model_from_pretrained, get_tokenizer
-import torchvision.transforms as T
+import sys
+import argparse
 import random
 import numpy as np
+from tqdm import tqdm
+from PIL import Image
+from collections import defaultdict
 
-# --- 1. 配置 ---
-DEVICE = "cuda:2"
-CLASSES_TXT = "CUB_200_2011/classes.txt"
-REAL_IMAGE_BASE_DIR = "datasets/CUB_test"
-GENERATED_IMAGE_DIR = "results/CUB"
-CLIP_MODEL = "ViT-B-32"
-CLIP_PRETRAINED = "laion2b_s34b_b79k"
-SIGLIP_MODEL = 'hf-hub:timm/ViT-SO400M-14-SigLIP-384'
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as T
 
-# RAG 增强后图像的文件名参数 (来自 imageRAG_OmniGen_3gpu.py)
-GUIDANCE_SCALE = 2.5
-IMAGE_GUIDANCE_SCALE = 1.6
+import open_clip
+from open_clip import create_model_from_pretrained, get_tokenizer
+from torchmetrics.image.kid import KernelInceptionDistance
 
-# --- 2. 加载评估模型 ---
+# --------------------------------------------------
+# --- 1. Args ---
+# --------------------------------------------------
+parser = argparse.ArgumentParser(description="Evaluate CUB (All Methods)")
+parser.add_argument("--device_id", type=int, default=0)
+parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
+parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
 
-# a) 加载 DINO
-print(f"正在 {DEVICE} 上加载 DINO (vits16)...")
-dino_model = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
-dino_model = dino_model.eval().to(DEVICE)
-dino_transform = T.Compose([
-    T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
-    T.CenterCrop(224),
-    T.ToTensor(),
-    T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-])
+args = parser.parse_args()
 
-# b) 加载 OpenCLIP (用于 CLIP Score)
-print(f"正在 {DEVICE} 上加载 OpenCLIP 模型 ({CLIP_MODEL})...")
-clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-    CLIP_MODEL,
-    pretrained=CLIP_PRETRAINED
-)
-clip_model = clip_model.eval().to(DEVICE)
-clip_tokenizer = open_clip.get_tokenizer(CLIP_MODEL)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
-# c) 加载 SigLIP
-print(f"正在 {DEVICE} 上加载 SigLIP 模型 ({SIGLIP_MODEL})...")
-siglip_model, siglip_preprocess = create_model_from_pretrained(
-    SIGLIP_MODEL,
-    device=DEVICE
-)
-siglip_model = siglip_model.eval().to(DEVICE)
-siglip_tokenizer = get_tokenizer(SIGLIP_MODEL)
-print("所有模型加载完毕。")
+# --------------------------------------------------
+# --- Config ---
+# --------------------------------------------------
+DATASET_CONFIG = {
+    "classes_txt": "datasets/CUB_200_2011/classes.txt",
+    "real_images_root": "datasets/CUB_200_2011/images",
+}
 
-# --- 3. 加载类别列表 ---
-print(f"正在从 {CLASSES_TXT} 加载类别列表...")
-class_names_map = {} # {0: "001.Black...", 1: "002.Laysan..."}
-with open(CLASSES_TXT) as f:
-    for line in f.readlines():
-        parts = line.strip().split()
-        label_id_zero_based = int(parts[0]) - 1 # 0-索引
-        full_class_name = parts[1]
-        class_names_map[label_id_zero_based] = full_class_name
-print(f"找到了 {len(class_names_map)} 个类别。")
+METHODS = {
+    "Baseline": "results/OmniGenV2_Baseline_CUB",
+    "BC_SR": "results/OmniGenV2_BC_SR_CUB",
+    "BC_MGR": "results/OmniGenV2_BC_MGR_CUB",
+    "TAC_SR": "results/OmniGenV2_TAC_SR_CUB",
+    "TAC_MGR": "results/OmniGenV2_TAC_MGR_CUB"
+}
 
-# --- 4. 运行评估循环 ---
+# --------------------------------------------------
+# --- 2. Model Loader ---
+# --------------------------------------------------
+def load_models(device):
+    models = {}
+    models['dino_transform'] = T.Compose([
+        T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
 
-# 为 "no RAG" 和 "RAG" 分别创建分数列表
-scores_no_rag = {'clip': [], 'siglip': [], 'dino': []}
-scores_rag = {'clip': [], 'siglip': [], 'dino': []}
-
-# 映射真实图像（不变）
-real_image_map = {}
-print(f"正在从 {REAL_IMAGE_BASE_DIR} 映射真实图像...")
-for class_name in os.listdir(REAL_IMAGE_BASE_DIR):
-    class_dir = os.path.join(REAL_IMAGE_BASE_DIR, class_name)
-    if os.path.isdir(class_dir):
-        try:
-            label_id = int(class_name.split('.')[0]) - 1
-            real_image_map[label_id] = [
-                os.path.join(class_dir, f) for f in os.listdir(class_dir)
-            ]
-        except ValueError:
-            pass
-print(f"找到了 {len(real_image_map)} 个类别的真实图像。")
-
-unique_labels_to_evaluate = list(class_names_map.keys())
-
-for label_id in tqdm(unique_labels_to_evaluate, desc="评估 CUB 图像"):
+    # 1. DINO v3
+    print(f"Loading DINO v3...")
+    sys.path.append(args.dinov3_repo_path)
     try:
-        full_class_name = class_names_map[label_id]
-
-        # --- 1. 准备 Prompt 和 真实图像 ---
-        simple_name = full_class_name.split('.')[-1].replace('_', ' ')
-        prompt = f"a photo of a {simple_name}"
-
-        # 获取真实图像 (用于 DINO)
-        if label_id not in real_image_map or not real_image_map[label_id]:
-            continue # 如果测试集中没有该类别的图像，则跳过
-
-        real_image_path = random.choice(real_image_map[label_id])
-        real_image_pil = Image.open(real_image_path).convert("RGB")
-
-        # --- 2. 预处理 真实图像 和 文本 (只需一次) ---
-        with torch.no_grad():
-            real_dino_input = dino_transform(real_image_pil).unsqueeze(0).to(DEVICE)
-            real_features_dino = dino_model(real_dino_input)
-
-            text_clip_input = clip_tokenizer([prompt]).to(DEVICE)
-            text_features_clip = clip_model.encode_text(text_clip_input)
-            text_features_clip /= text_features_clip.norm(dim=-1, keepdim=True)
-
-            text_siglip_input = siglip_tokenizer([prompt]).to(DEVICE)
-            text_features_siglip = siglip_model.encode_text(text_siglip_input)
-            text_features_siglip = F.normalize(text_features_siglip, dim=-1)
-
-        # --- 3. 查找并评估 "no RAG" 图像 ---
-        no_rag_filename = f"{label_id:03d}_{full_class_name}_no_imageRAG.png"
-        no_rag_image_path = os.path.join(GENERATED_IMAGE_DIR, no_rag_filename)
-
-        if os.path.exists(no_rag_image_path):
-            gen_image_pil = Image.open(no_rag_image_path).convert("RGB")
-            with torch.no_grad():
-                # DINO
-                gen_dino_input = dino_transform(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_dino = dino_model(gen_dino_input)
-                scores_no_rag['dino'].append(F.cosine_similarity(gen_features_dino, real_features_dino).item())
-
-                # CLIP
-                gen_clip_input = clip_preprocess(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_clip = clip_model.encode_image(gen_clip_input)
-                gen_features_clip /= gen_features_clip.norm(dim=-1, keepdim=True)
-                scores_no_rag['clip'].append((gen_features_clip @ text_features_clip.T).item())
-
-                # SigLIP
-                gen_siglip_input = siglip_preprocess(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_siglip = siglip_model.encode_image(gen_siglip_input)
-                gen_features_siglip = F.normalize(gen_features_siglip, dim=-1)
-                scores_no_rag['siglip'].append((gen_features_siglip @ text_features_siglip.T).item())
-
-        # --- 4. 查找并评估 "RAG" 图像 ---
-        rag_filename = f"{label_id:03d}_{full_class_name}_gs_{GUIDANCE_SCALE}_im_gs_{IMAGE_GUIDANCE_SCALE}.png"
-        rag_image_path = os.path.join(GENERATED_IMAGE_DIR, rag_filename)
-
-        if os.path.exists(rag_image_path):
-            gen_image_pil = Image.open(rag_image_path).convert("RGB")
-            with torch.no_grad():
-                # DINO
-                gen_dino_input = dino_transform(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_dino = dino_model(gen_dino_input)
-                scores_rag['dino'].append(F.cosine_similarity(gen_features_dino, real_features_dino).item())
-
-                # CLIP
-                gen_clip_input = clip_preprocess(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_clip = clip_model.encode_image(gen_clip_input)
-                gen_features_clip /= gen_features_clip.norm(dim=-1, keepdim=True)
-                scores_rag['clip'].append((gen_features_clip @ text_features_clip.T).item())
-
-                # SigLIP
-                gen_siglip_input = siglip_preprocess(gen_image_pil).unsqueeze(0).to(DEVICE)
-                gen_features_siglip = siglip_model.encode_image(gen_siglip_input)
-                gen_features_siglip = F.normalize(gen_features_siglip, dim=-1)
-                scores_rag['siglip'].append((gen_features_siglip @ text_features_siglip.T).item())
-
+        models['dino_v3'] = torch.hub.load(args.dinov3_repo_path, 'dinov3_vitb16', source='local', pretrained=False)
+        ckpt = torch.load(args.dinov3_weights_path, map_location='cpu')
+        state_dict = ckpt.get('model', ckpt.get('teacher', ckpt))
+        new_state_dict = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        models['dino_v3'].load_state_dict(new_state_dict, strict=False)
+        models['dino_v3'] = models['dino_v3'].to(device).eval()
     except Exception as e:
-        print(f"\n处理 {full_class_name} 时出错: {e}")
+        print(f"Error loading DINO v3: {e}")
+        sys.exit(1)
 
-# --- 5. 显示最终结果 ---
-print("\n--- 评估完成 ---")
+    # 2. DINO v2
+    print("Loading DINO v2...")
+    models['dino_v2'] = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device).eval()
 
-print("\n--- 评估结果 (no RAG) ---")
-if len(scores_no_rag['clip']) > 0:
-    print(f"CLIP Score :   {np.mean(scores_no_rag['clip']):.4f}")
-    print(f"SigLIP Score : {np.mean(scores_no_rag['siglip']):.4f}")
-    print(f"DINO Score :   {np.mean(scores_no_rag['dino']):.4f}")
-    print(f"\n(基于 {len(scores_no_rag['clip'])} / {len(unique_labels_to_evaluate)} 个已找到的 'no RAG' 图像)")
-else:
-    print("未找到 'no RAG' 图像 (例如: *_no_imageRAG.png)")
+    # 3. DINO v1
+    print("Loading DINO v1...")
+    models['dino_v1'] = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16').to(device).eval()
 
-print("\n--- 评估结果 (RAG后) ---")
-if len(scores_rag['clip']) > 0:
-    print(f"CLIP Score :   {np.mean(scores_rag['clip']):.4f}")
-    print(f"SigLIP Score : {np.mean(scores_rag['siglip']):.4f}")
-    print(f"DINO Score :   {np.mean(scores_rag['dino']):.4f}")
-    print(f"\n(基于 {len(scores_rag['clip'])} / {len(unique_labels_to_evaluate)} 个已找到的 'RAG' 图像)")
-else:
-    print("未找到 'RAG' 图像 (例如: *_gs_2.5_im_gs_1.6.png)")
+    # 4. CLIP
+    print("Loading CLIP...")
+    models['clip_model'], _, models['clip_preprocess'] = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    models['clip_model'] = models['clip_model'].eval().to(device)
+    models['clip_tokenizer'] = open_clip.get_tokenizer("ViT-B-32")
+
+    # 5. SigLIP
+    print("Loading SigLIP...")
+    sig_name = 'hf-hub:timm/ViT-SO400M-14-SigLIP-384'
+    models['siglip_model'], models['siglip_preprocess'] = create_model_from_pretrained(sig_name, device=device)
+    models['siglip_model'] = models['siglip_model'].eval().to(device)
+    models['siglip_tokenizer'] = get_tokenizer(sig_name)
+
+    # 6. KID (One per method)
+    print("Initializing KID...")
+    models['kid'] = {}
+    for m in METHODS.keys():
+        models['kid'][m] = KernelInceptionDistance(subset_size=25, normalize=True).to(device)
+
+    models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
+
+    return models
+
+# --------------------------------------------------
+# --- 3. Data Loader ---
+# --------------------------------------------------
+def load_cub_tasks(config):
+    print("Loading CUB Task List...")
+    tasks = []
+
+    with open(config['classes_txt']) as f:
+        for line in f:
+            parts = line.strip().split(' ', 1)
+            if len(parts) < 2: continue
+
+            folder_name = parts[1]
+            simple_name = folder_name.split('.', 1)[-1].replace('_', ' ')
+            safe_name = simple_name.replace(" ", "_").replace("/", "-")
+
+            class_dir = os.path.join(config['real_images_root'], folder_name)
+            real_paths = []
+            if os.path.isdir(class_dir):
+                for img in os.listdir(class_dir):
+                    if img.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        real_paths.append(os.path.join(class_dir, img))
+
+            tasks.append({
+                "prompt": f"a photo of a {simple_name}",
+                "safe_filename_prefix": safe_name,
+                "real_image_paths": real_paths
+            })
+    return tasks
+
+# --------------------------------------------------
+# --- 4. Evaluation Logic ---
+# --------------------------------------------------
+def get_dino_features_batch(paths, model, transform, device, batch_size=32):
+    feats = []
+    eval_paths = paths[:50]
+    for i in range(0, len(eval_paths), batch_size):
+        batch_paths = eval_paths[i:i+batch_size]
+        batch_imgs = []
+        for p in batch_paths:
+            try: batch_imgs.append(transform(Image.open(p).convert("RGB")))
+            except: pass
+        if not batch_imgs: continue
+        batch_tensor = torch.stack(batch_imgs).to(device)
+        with torch.no_grad():
+            out = model(batch_tensor)
+            feats.append(out)
+    if not feats: return None
+    return F.normalize(torch.cat(feats, dim=0), dim=-1)
+
+def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
+    scores = {}
+    try:
+        img = Image.open(img_path).convert("RGB")
+        with torch.no_grad():
+            # DINO
+            dino_in = models['dino_transform'](img).unsqueeze(0).to(device)
+            for ver in ['v1', 'v2', 'v3']:
+                out = models[f'dino_{ver}'](dino_in)
+                out = F.normalize(out, dim=-1)
+                scores[f'dino{ver}_base'] = F.cosine_similarity(out, real_feats_map[ver]).mean().item()
+
+            # CLIP
+            c_in = models['clip_preprocess'](img).unsqueeze(0).to(device)
+            c_feat = models['clip_model'].encode_image(c_in)
+            c_feat /= c_feat.norm(dim=-1, keepdim=True)
+            scores['clip'] = (c_feat @ txt_feats['clip'].T).item()
+
+            # SigLIP
+            s_in = models['siglip_preprocess'](img).unsqueeze(0).to(device)
+            s_feat = models['siglip_model'].encode_image(s_in)
+            s_feat = F.normalize(s_feat, dim=-1)
+            scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
+    except Exception as e:
+        # print(f"Error evaluating {img_path}: {e}")
+        return None
+    return scores
+
+# --------------------------------------------------
+# --- 5. Main ---
+# --------------------------------------------------
+def main():
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    models = load_models(device)
+    tasks = load_cub_tasks(DATASET_CONFIG)
+
+    # Storage for results
+    results = {m: [] for m in METHODS.keys()}
+
+    print(f"\nStarting evaluation on {len(tasks)} CUB classes...")
+
+    for task in tqdm(tasks):
+        # 1. Get Real Features
+        real_paths = task["real_image_paths"]
+        if not real_paths: continue
+
+        real_feats = {}
+        for ver in ['v1', 'v2', 'v3']:
+            real_feats[ver] = get_dino_features_batch(real_paths, models[f'dino_{ver}'], models['dino_transform'], device)
+        if any(v is None for v in real_feats.values()): continue
+
+        # 2. Get Text Features
+        txt_feats = {}
+        with torch.no_grad():
+            ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
+            txt_feats['clip'] = models['clip_model'].encode_text(ctk)
+            txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
+
+            stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+            txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
+            txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
+
+        # 3. Update KID (Real) - Update ALL KID models with real data
+        kp = random.sample(real_paths, min(len(real_paths), 20))
+        kimgs = []
+        for p in kp:
+            try: kimgs.append(models['kid_transform'](Image.open(p).convert("RGB")))
+            except: pass
+
+        if kimgs:
+            kt = torch.stack(kimgs).to(device)
+            for m in METHODS.keys():
+                models['kid'][m].update(kt, real=True)
+
+        # 4. Evaluate Each Method
+        for method_name, dir_path in METHODS.items():
+            # Determine file path
+            if method_name == "Baseline":
+                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V1.png")
+            else:
+                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_FINAL.png")
+
+            if not os.path.exists(img_path):
+                continue
+
+            # Eval
+            res = evaluate_single(img_path, real_feats, txt_feats, models, device)
+            if res:
+                results[method_name].append(res)
+                try:
+                    models['kid'][method_name].update(
+                        models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device),
+                        real=False
+                    )
+                except: pass
+
+    # Report
+    print("\n" + "="*80)
+    print(f"  EVAL REPORT: CUB (All Methods)")
+    print("="*80)
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
+    print("-" * 80)
+
+    for method_name in METHODS.keys():
+        lst = results[method_name]
+        if not lst:
+            print(f"{method_name:<15} | N/A")
+            continue
+
+        # Compute KID
+        try:
+            kid_score, _ = models['kid'][method_name].compute()
+            kid_val = kid_score.item()
+        except:
+            kid_val = 0.0
+
+        clip_s = np.mean([x['clip'] for x in lst])
+        siglip_s = np.mean([x['siglip'] for x in lst])
+        d1 = np.mean([x['dinov1_base'] for x in lst])
+        d2 = np.mean([x['dinov2_base'] for x in lst])
+        d3 = np.mean([x['dinov3_base'] for x in lst])
+
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f}")
+
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
