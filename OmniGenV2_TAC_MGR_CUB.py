@@ -45,7 +45,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 
 # Generation Params
 parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
-parser.add_argument("--max_retries", type=int, default=1)
+parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=2.5) # Higher for TAC logic
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/cub")
@@ -90,7 +90,8 @@ def setup_system():
             args.omnigen2_model_path,
             torch_dtype=torch.float16,
             transformer_lora_path=args.transformer_lora_path,
-            trust_remote_code=True
+            trust_remote_code=True,
+            mllm_kwargs={"attn_implementation": "flash_attention_2"}
         )
         # Patch for AttributeError
         if not hasattr(pipe.transformer, "enable_teacache"):
@@ -246,10 +247,12 @@ if __name__ == "__main__":
             status = diagnosis.get('status')
             score = diagnosis.get('score', 0)
             error_type = diagnosis.get('error_type', 'other')
-            features = diagnosis.get('features', [])
+            needed_modifications = diagnosis.get('needed_modifications', [])
+            correct_features = diagnosis.get('correct_features', [])
             critique = diagnosis.get('critique', '')
 
             f_log.write(f"Decision: {status} | Score: {score} | Type: {error_type}\nCritique: {critique}\n")
+            f_log.write(f"Correct: {correct_features}\nMods: {needed_modifications}\n")
 
             # Update Best
             if score > best_score:
@@ -262,13 +265,16 @@ if __name__ == "__main__":
                 break
 
             # B. Retrieval (MGR)
-            # Query = Prompt + Features detected by TAC
-            feature_text = ", ".join(features) if features else ""
-            query = f"{prompt}. {feature_text}"
+            # Query = Prompt + Needed Modifications (Target State)
+            mod_text = ", ".join(needed_modifications)
+
+            query_parts = [prompt]
+            if needed_modifications: query_parts.append(mod_text)
+            query = ". ".join(query_parts)
 
             # [FIX] Truncate query to avoid CLIP context length overflow (77 tokens)
             if len(query) > 300:
-                query = f"{prompt}. {feature_text[:200]}..."
+                query = query[:300] + "..."
 
             f_log.write(f"Query: {query}\n")
 
@@ -307,31 +313,37 @@ if __name__ == "__main__":
             global_memory.add(best_ref)
 
             # [Adaptive Guidance Scale]
-            # Heuristic: If similarity score is high (>0.3), trust the reference more (scale up to 3.5).
-            # If low (<0.25), trust less (scale down to 2.0).
-            # Base scale is 2.5.
-            # Formula: scale = 1.0 + (score * 8.0) clamped to [2.0, 4.0]
-            # Example: 0.25 * 8 = 2.0 + 1.0 = 3.0
-            # Example: 0.30 * 8 = 2.4 + 1.0 = 3.4
-            adaptive_scale = 2.0 + (best_ref_score * 5.0)
-            adaptive_scale = max(2.5, min(adaptive_scale, 4.5))
+            # Optimization: Unified scale centered around 3.0
+            # Formula: 2.0 + (score * 4.0). Range: [2.6, 3.4]
+            adaptive_scale = 2.0 + (best_ref_score * 4.0)
+            adaptive_scale = max(2.6, min(adaptive_scale, 3.4))
 
-            f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f}) -> Adaptive Scale: {adaptive_scale:.2f}\n")
+            # [Fix] Relax scale for wrong_concept to force change
+            if error_type == "wrong_concept":
+                 adaptive_scale = max(adaptive_scale, 3.0)
+
             f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f}) -> Adaptive Scale: {adaptive_scale:.2f}\n")
 
             # C. Dynamic Dispatch & Composition
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
-            # Construct correction instruction with features if available
-            correction_instruction = f"{error_type}: {feature_text}" if feature_text else error_type
+            # Construct correction instruction (Proactive & Concise)
+            # "Fix [error_type]. [Modifications]."
+            instruction_parts = []
+            if needed_modifications:
+                instruction_parts.append(f"{mod_text}")
+            else:
+                instruction_parts.append(f"Fix {error_type}")
+
+            correction_instruction = ". ".join(instruction_parts)
 
             # Logic: Use Regen for compositional/concept errors; Edit for others
             if error_type in ["role_binding_error", "attribute_binding_error", "spatial_relation_error", "wrong_concept", "missing_object"]:
-                regen_prompt = f"{prompt}. Correct the {correction_instruction}. Use <|image_1|> as a visual reference."
+                regen_prompt = f"{prompt}. {correction_instruction}. Use <|image_1|> as a visual reference."
                 f_log.write(f"Regen Prompt: {regen_prompt}\n")
                 run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=adaptive_scale)
             else:
-                edit_prompt = f"Edit this image to fix {correction_instruction}. Reference style: <|image_1|>"
+                edit_prompt = f"Edit this image to {correction_instruction}. Reference style: <|image_1|>"
                 f_log.write(f"Edit Prompt: {edit_prompt}\n")
                 # For Edit, we usually want stronger guidance, so we boost the adaptive scale slightly
                 edit_scale = max(2.5, adaptive_scale)

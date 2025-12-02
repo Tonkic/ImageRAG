@@ -1,20 +1,19 @@
 '''
-OmniGenV2_BC_SR_CUB.py
+OmniGenV2_BC_SR_Aircraft.py
 =============================
 Configuration:
   - Generator: OmniGen V2
-  - Critic: Binary Critic (BC)
-  - Retrieval: Static Retrieval (SR)
-  - Dataset: CUB-200-2011
+  - Critic: Binary Critic (BC) -> Simple Success/Fail
+  - Retrieval: Static Retrieval (SR) -> Top-1, No Memory
+  - Dataset: FGVC-Aircraft
 
 Usage:
-  python OmniGenV2_BC_SR_CUB.py \
+  python OmniGenV2_BC_SR_Aircraft.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
       --omnigen2_path ./OmniGen2 \
-      --openai_api_key "sk-..." \
-      --seed 42
+      --openai_api_key "sk-..."
 '''
 
 import argparse
@@ -29,7 +28,7 @@ from PIL import Image
 from tqdm import tqdm
 
 # --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + BC + SR (CUB)")
+parser = argparse.ArgumentParser(description="OmniGenV2 + BC + SR (Aircraft)")
 
 parser.add_argument("--device_id", type=int, required=True)
 parser.add_argument("--task_index", type=int, default=0)
@@ -44,7 +43,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=1)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=3.0)
-parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/cub")
+parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
 
 args = parser.parse_args()
 
@@ -53,8 +52,9 @@ import openai
 import clip
 
 # ------------------------------------------------------------------
-from binary_critic import retrieval_caption_generation  # Critic
-from static_retrieval import retrieve_img_per_caption # Retrieval (Static)
+# [IMPORTS] BC + SR
+from binary_critic import retrieval_caption_generation  # Binary Critic
+from static_retrieval import retrieve_img_per_caption   # Static Retrieval
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -67,10 +67,10 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 DATASET_CONFIG = {
-    "classes_txt": "datasets/CUB_200_2011/classes.txt",
-    "train_list": "datasets/CUB_200_2011/images.txt",
-    "image_root": "datasets/CUB_200_2011/images",
-    "output_path": "results/OmniGenV2_BC_SR_CUB"
+    "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
+    "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
+    "image_root": "datasets/fgvc-aircraft-2013b/data/images",
+    "output_path": "results/OmniGenV2_BC_SR_Aircraft"
 }
 
 def setup_system():
@@ -81,7 +81,7 @@ def setup_system():
         from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             transformer_lora_path=args.transformer_lora_path,
             trust_remote_code=True
         )
@@ -91,9 +91,11 @@ def setup_system():
     except ImportError:
         print("Error: OmniGen2 not found.")
         sys.exit(1)
-    # os.environ.pop("http_proxy", None)
-    # os.environ.pop("https_proxy", None)
-    # os.environ.pop("all_proxy", None)
+
+    os.environ.pop("http_proxy", None)
+    os.environ.pop("https_proxy", None)
+    os.environ.pop("all_proxy", None)
+
     client = openai.OpenAI(
         api_key=args.openai_api_key,
         base_url="https://api.siliconflow.cn/v1/"
@@ -101,14 +103,13 @@ def setup_system():
     return pipe, client
 
 def load_retrieval_db():
-    print(f"Loading CUB Retrieval DB...")
+    print(f"Loading Aircraft Retrieval DB...")
     paths = []
     with open(DATASET_CONFIG['train_list'], 'r') as f:
         for line in f.readlines():
             line = line.strip()
             if not line: continue
-            image_filename = line.split(' ')[-1]
-            img_path = os.path.join(DATASET_CONFIG['image_root'], image_filename)
+            img_path = os.path.join(DATASET_CONFIG['image_root'], f"{line}.jpg")
             if os.path.exists(img_path):
                 paths.append(img_path)
     print(f"Loaded {len(paths)} images.")
@@ -117,6 +118,7 @@ def load_retrieval_db():
 def run_omnigen(pipe, prompt, input_images, output_path, seed):
     if isinstance(input_images, str):
         input_images = [input_images]
+
     processed_imgs = []
     for img in input_images:
         try:
@@ -141,26 +143,8 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed):
 
 if __name__ == "__main__":
     seed_everything(args.seed)
-
-    # 1. Load DB & Pre-calculate Embeddings (BEFORE loading OmniGen)
-    retrieval_db = load_retrieval_db()
-    print("Pre-calculating/Loading retrieval embeddings on GPU...")
-    try:
-        # Run a dummy retrieval on the FULL database to force caching
-        retrieve_img_per_caption(
-            ["warmup_query"],
-            retrieval_db,
-            embeddings_path=args.embeddings_path,
-            k=1,
-            device="cuda"
-        )
-        torch.cuda.empty_cache()
-        print("Retrieval embeddings cached successfully.")
-    except Exception as e:
-        print(f"Warning during embedding caching: {e}")
-
     pipe, client = setup_system()
-    # retrieval_db = load_retrieval_db() # Already loaded
+    retrieval_db = load_retrieval_db()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     with open(DATASET_CONFIG['classes_txt'], 'r') as f:
@@ -170,24 +154,23 @@ if __name__ == "__main__":
     print(f"Processing {len(my_classes)} classes.")
 
     for class_name in tqdm(my_classes):
-        simple_name = class_name.split('.', 1)[-1].replace('_', ' ')
-        safe_name = simple_name.replace(" ", "_").replace("/", "-")
-        prompt = f"a photo of a {simple_name}"
+        safe_name = class_name.replace(" ", "_").replace("/", "-")
+        prompt = f"a photo of a {class_name}"
 
         final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
         if os.path.exists(final_success_path):
-            print(f"Skipping {safe_name}: Already finished successfully.")
+            print(f"Skipping {safe_name}: Already finished.")
             continue
 
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")
         f_log.write(f"Prompt: {prompt}\n")
 
-        # --- Phase 1: Initial Generation ---
+        # Phase 1: Initial
         v1_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V1.png")
 
         # [Optimization] Shared Baseline Logic
-        baseline_dir = "results/OmniGenV2_Baseline_CUB"
+        baseline_dir = "results/OmniGenV2_Baseline_Aircraft"
         baseline_v1_path = os.path.join(baseline_dir, f"{safe_name}_V1.png")
 
         if not os.path.exists(v1_path):
@@ -205,19 +188,11 @@ if __name__ == "__main__":
         current_image = v1_path
         retry_cnt = 0
 
-        # Static Retrieval: Retrieve ONCE
-        # [关键修复] static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
-        # [Fix] Use device="cpu" to avoid OOM
-        retrieved_lists, _ = retrieve_img_per_caption(
-            [prompt], retrieval_db,
-            embeddings_path=args.embeddings_path,
-            k=1, device="cpu"
-        )
-        best_ref = retrieved_lists[0][0] # Top-1
-
+        # Loop (Static Retrieval = No Exclusion List)
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
+            # 1. Critic (Binary)
             diagnosis = retrieval_caption_generation(
                 prompt, [current_image],
                 gpt_client=client, model=args.llm_model
@@ -231,7 +206,21 @@ if __name__ == "__main__":
                 shutil.copy(current_image, final_success_path)
                 break
 
-            f_log.write(f">> Ref (Static): {best_ref}\n")
+            # 2. Retrieval (Static)
+            # Always retrieve Top-1 based on the original prompt
+            # (Since BC doesn't give us fine-grained features to augment the query)
+            retrieved_lists, _ = retrieve_img_per_caption(
+                [prompt], retrieval_db,
+                embeddings_path=args.embeddings_path,
+                k=1, device="cuda"
+            )
+
+            if not retrieved_lists[0]:
+                f_log.write(">> Retrieval failed.\n")
+                break
+
+            best_ref = retrieved_lists[0][0]
+            f_log.write(f">> Static Ref: {best_ref}\n")
 
             # 3. Generation
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")

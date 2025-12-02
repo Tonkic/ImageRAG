@@ -61,13 +61,14 @@ class GlobalMemory:
         """
         Record feedback from the VLM/Critic.
 
-        Args:
-            image_path: Path to the retrieved image.
-            prompt: The query prompt (e.g., "a photo of a 707-320").
-            actual_label: If mismatch, what is it actually? (e.g., "707-200").
-            is_match: Boolean, does the image match the prompt?
+        Strategy:
+        1. If Match (is_match=True):
+           - Add Positive Sample: (Image, Prompt) -> Label 1
+        2. If Mismatch (is_match=False):
+           - Add Negative Sample: (Image, Prompt) -> Label 0
+           - If actual_label is provided, Add Positive Sample: (Image, "a photo of {actual_label}") -> Label 1
         """
-        # 1. Record the direct feedback
+        # 1. Record the direct feedback (Positive or Negative)
         entry = {
             "image_path": image_path,
             "prompt": prompt,
@@ -77,9 +78,9 @@ class GlobalMemory:
         }
         self.memory.append(entry)
 
-        # 2. If we have a correction, add the implicit positive
+        # 2. If we have a correction (Mismatch + Actual Label), add the implicit positive
         # Example: Prompt="707-320", Image=ImgA, Match=False, Actual="707-200"
-        # We add: (ImgA, "a photo of a 707-200") -> True
+        # We add: (ImgA, "a photo of a 707-200") -> True (Label 1)
         if not is_match and actual_label:
             correction_prompt = f"a photo of a {actual_label}"
             self.memory.append({

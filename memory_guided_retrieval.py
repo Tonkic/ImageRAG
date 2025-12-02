@@ -35,7 +35,7 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
             current_batch_paths = image_paths[bi : bi + bs]
 
             if os.path.exists(cache_file):
-                data = torch.load(cache_file, map_location=device)
+                data = torch.load(cache_file, map_location=device, weights_only=False)
                 normalized_im_vectors = data['normalized_clip_embeddings']
                 final_bi_paths = data.get('paths', current_batch_paths)
             else:
@@ -116,7 +116,7 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
             current_batch_paths = image_paths[bi : bi + bs]
 
             if os.path.exists(cache_file):
-                data = torch.load(cache_file, map_location=device)
+                data = torch.load(cache_file, map_location=device, weights_only=False)
                 normalized_im_vectors = data['normalized_siglip_embeddings']
                 final_bi_paths = data.get('paths', current_batch_paths)
 

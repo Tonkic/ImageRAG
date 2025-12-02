@@ -83,7 +83,8 @@ def setup_system():
             args.omnigen2_model_path,
             torch_dtype=torch.float16,
             transformer_lora_path=args.transformer_lora_path,
-            trust_remote_code=True
+            trust_remote_code=True,
+            mllm_kwargs={"attn_implementation": "flash_attention_2"}
         )
         # 手动修补可能缺失的属性
         if not hasattr(pipe.transformer, "enable_teacache"):
