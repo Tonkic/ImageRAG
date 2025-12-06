@@ -19,13 +19,6 @@ Usage:
 import argparse
 import sys
 import os
-import json
-import shutil
-import numpy as np
-import torch
-import random
-from PIL import Image
-from tqdm import tqdm
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + BC + SR (Aircraft)")
@@ -48,6 +41,16 @@ parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import json
+import shutil
+import numpy as np
+import torch
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
+import random
+from PIL import Image
+from tqdm import tqdm
 import openai
 import clip
 
@@ -87,14 +90,16 @@ def setup_system():
         )
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
         pipe.to("cuda")
     except ImportError:
         print("Error: OmniGen2 not found.")
         sys.exit(1)
 
-    os.environ.pop("http_proxy", None)
-    os.environ.pop("https_proxy", None)
-    os.environ.pop("all_proxy", None)
+    # os.environ.pop("http_proxy", None)
+    # os.environ.pop("https_proxy", None)
+    # os.environ.pop("all_proxy", None)
 
     client = openai.OpenAI(
         api_key=args.openai_api_key,
@@ -230,5 +235,11 @@ if __name__ == "__main__":
 
             current_image = next_path
             retry_cnt += 1
+
+        if not os.path.exists(final_success_path):
+            f_log.write(f"\n--- Final Check (Last Generated) ---\n")
+            f_log.write(f">> Loop finished. Saving last image to FINAL.\n")
+            if os.path.exists(current_image):
+                shutil.copy(current_image, final_success_path)
 
         f_log.close()

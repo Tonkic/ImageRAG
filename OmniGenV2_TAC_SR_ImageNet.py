@@ -24,6 +24,7 @@ import json
 import shutil
 import numpy as np
 import torch
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 import random
 from PIL import Image
 from tqdm import tqdm
@@ -49,6 +50,7 @@ parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
 import openai
 import clip
 
@@ -87,6 +89,8 @@ def setup_system():
         )
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
         pipe.to("cuda")
     except ImportError:
         print("Error: OmniGen2 not found.")

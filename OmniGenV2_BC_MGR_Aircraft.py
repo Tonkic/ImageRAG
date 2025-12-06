@@ -20,13 +20,6 @@ Usage:
 import argparse
 import sys
 import os
-import json
-import shutil
-import numpy as np
-import torch
-import random
-from PIL import Image
-from tqdm import tqdm
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + BC + MGR (Aircraft)")
@@ -43,18 +36,29 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=1)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=3.0) # Increased from 2.0 to 3.0 to fix KID
+parser.add_argument("--image_guidance_scale", type=float, default=3.0)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
 
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import json
+import shutil
+import numpy as np
+import torch
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
+import random
+from PIL import Image
+from tqdm import tqdm
 import openai
 import clip
 
 # ------------------------------------------------------------------
 from binary_critic import retrieval_caption_generation  # Critic
-from memory_guided_retrieval import retrieve_img_per_caption, GlobalMemory # Retrieval
+from memory_guided_retrieval import retrieve_img_per_caption
+from global_memory import GlobalMemory # Retrieval
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -89,13 +93,15 @@ def setup_system():
         # 手动修补可能缺失的属性
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
         pipe.to("cuda")
     except ImportError:
         print("Error: OmniGen2 not found.")
         sys.exit(1)
-    os.environ.pop("http_proxy", None)
-    os.environ.pop("https_proxy", None)
-    os.environ.pop("all_proxy", None)
+    # os.environ.pop("http_proxy", None)
+    # os.environ.pop("https_proxy", None)
+    # os.environ.pop("all_proxy", None)
     client = openai.OpenAI(
         api_key=args.openai_api_key,
         base_url="https://api.siliconflow.cn/v1/"
@@ -215,6 +221,7 @@ if __name__ == "__main__":
         current_image = v1_path
         retry_cnt = 0
         global_memory = GlobalMemory()
+        last_used_ref = None
 
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
@@ -229,6 +236,12 @@ if __name__ == "__main__":
 
             status = diagnosis.get('status')
             f_log.write(f"Decision: {status}\n")
+
+            # [MGR Feedback Loop]
+            if last_used_ref is not None:
+                is_match = (status == 'success')
+                global_memory.add_feedback(last_used_ref, prompt, is_match=is_match)
+                print(f"  [MGR] Feedback recorded for {os.path.basename(last_used_ref)}: {'Match' if is_match else 'Mismatch'}")
 
             if status == 'success':
                 f_log.write(">> Success!\n")
@@ -254,6 +267,7 @@ if __name__ == "__main__":
 
             best_ref = candidates[0]
             global_memory.add(best_ref)
+            last_used_ref = best_ref
 
             f_log.write(f">> Ref: {best_ref}\n")
 
@@ -268,4 +282,21 @@ if __name__ == "__main__":
             current_image = next_path
             retry_cnt += 1
 
+        if not os.path.exists(final_success_path):
+            f_log.write(f"\n--- Final Check (Last Generated) ---\n")
+            f_log.write(f">> Loop finished. Saving last image to FINAL.\n")
+            if os.path.exists(current_image):
+                shutil.copy(current_image, final_success_path)
+
         f_log.close()
+
+    # --- End of Class Loop ---
+    print("\n============================================")
+    print("All classes processed. Starting Global Memory Training...")
+    try:
+        # Re-initialize to ensure clean state and load all accumulated memory
+        trainer_memory = GlobalMemory()
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+    except Exception as e:
+        print(f"Error during training: {e}")
+    print("============================================")

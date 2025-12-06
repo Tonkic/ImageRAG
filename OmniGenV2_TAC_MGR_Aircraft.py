@@ -20,13 +20,6 @@ Usage:
 import argparse
 import sys
 import os
-import json
-import shutil
-import numpy as np
-import torch
-from PIL import Image
-from tqdm import tqdm
-import random
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + MGR (Aircraft)")
@@ -54,12 +47,23 @@ args = parser.parse_args()
 
 # Environment
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import json
+import shutil
+import numpy as np
+import torch
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
+from PIL import Image
+from tqdm import tqdm
+import random
 import openai
 import clip
 
 # [IMPORTS] Custom Modules
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # TAC Logic
-from memory_guided_retrieval import retrieve_img_per_caption, GlobalMemory # MGR Logic
+from memory_guided_retrieval import retrieve_img_per_caption
+from global_memory import GlobalMemory # MGR Logic
 
 # --- 2. Reproducibility (Seed Fix) ---
 def seed_everything(seed):
@@ -96,6 +100,8 @@ def setup_system():
         # Patch for AttributeError
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
         pipe.to("cuda")
     except ImportError:
         print("Error: OmniGen2 not found.")
@@ -230,6 +236,7 @@ if __name__ == "__main__":
 
         # [MGR Core]: Global Memory for Re-ranking
         global_memory = GlobalMemory()
+        last_used_ref = None
 
         # [Score Tracking]
         best_score = -1
@@ -308,6 +315,7 @@ if __name__ == "__main__":
 
             # Add to Global Memory
             global_memory.add(best_ref)
+            last_used_ref = best_ref
 
             # [Adaptive Guidance Scale]
             # Optimization: Unified scale centered around 3.0 (Best performing in BC_MGR)
@@ -368,3 +376,14 @@ if __name__ == "__main__":
                 shutil.copy(best_image_path, final_success_path)
 
         f_log.close()
+
+    # --- End of Class Loop ---
+    print("\n============================================")
+    print("All classes processed. Starting Global Memory Training...")
+    try:
+        # Re-initialize to ensure clean state and load all accumulated memory
+        trainer_memory = GlobalMemory()
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+    except Exception as e:
+        print(f"Error during training: {e}")
+    print("============================================")

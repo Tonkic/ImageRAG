@@ -158,6 +158,35 @@ def load_aircraft_tasks(config):
 # --------------------------------------------------
 # --- 4. Evaluation Logic ---
 # --------------------------------------------------
+def get_best_image_path(method_name, dir_path, safe_filename_prefix):
+    if method_name == "Baseline":
+        img_path = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+    else:
+        # Try to find FINAL, if not, fallback to highest V number
+        final_path = os.path.join(dir_path, f"{safe_filename_prefix}_FINAL.png")
+        if os.path.exists(final_path):
+            img_path = final_path
+        else:
+            # Fallback logic: Find highest V number (up to V10)
+            best_v_path = None
+            for i in range(10, 1, -1): # Check V10 down to V2
+                p = os.path.join(dir_path, f"{safe_filename_prefix}_V{i}.png")
+                if os.path.exists(p):
+                    best_v_path = p
+                    break
+
+            # If no V2-V10, check V1
+            if not best_v_path:
+                v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+                if os.path.exists(v1_p):
+                    best_v_path = v1_p
+
+            img_path = best_v_path
+
+    if img_path and os.path.exists(img_path):
+        return img_path
+    return None
+
 def get_dino_features_batch(paths, model, transform, device, batch_size=32):
     feats = []
     eval_paths = paths[:50]
@@ -207,15 +236,30 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
 # --- 5. Main ---
 # --------------------------------------------------
 def main():
-    seed = 42
+    seed = 0
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    models = load_models(device)
+    # 1. Load Tasks First (Fast)
     tasks = load_aircraft_tasks(DATASET_CONFIG)
+
+    # 2. Pre-scan Counts
+    print(f"\nScanning generated images for {len(tasks)} tasks...")
+    counts = {m: 0 for m in METHODS.keys()}
+    for task in tasks:
+        for method_name, dir_path in METHODS.items():
+            if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
+                counts[method_name] += 1
+
+    print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
+    for m in METHODS.keys():
+        print(f"    - {m:<15}: {counts[m]}")
+    print("-" * 80)
+
+    models = load_models(device)
 
     # Storage for results
     results = {m: [] for m in METHODS.keys()}
@@ -260,13 +304,9 @@ def main():
 
         # 4. Evaluate Each Method
         for method_name, dir_path in METHODS.items():
-            # Determine file path
-            if method_name == "Baseline":
-                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V1.png")
-            else:
-                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_FINAL.png")
+            img_path = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
 
-            if not os.path.exists(img_path):
+            if not img_path:
                 continue
 
             # Eval
@@ -286,6 +326,7 @@ def main():
     print("\n" + "="*80)
     print(f"  EVAL REPORT: Aircraft (All Methods)")
     print("="*80)
+
     print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
     print("-" * 80)
 

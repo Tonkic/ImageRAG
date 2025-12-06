@@ -24,6 +24,7 @@ import json
 import shutil
 import numpy as np
 import torch
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 import random
 from PIL import Image
 from tqdm import tqdm
@@ -49,12 +50,14 @@ parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
 import openai
 import clip
 
 # ------------------------------------------------------------------
 from taxonomy_aware_critic import retrieval_caption_generation  # Critic
 from memory_guided_retrieval import retrieve_img_per_caption # Retrieval
+from global_memory import GlobalMemory
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -87,6 +90,8 @@ def setup_system():
         )
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
         pipe.to("cuda")
     except ImportError:
         print("Error: OmniGen2 not found.")
@@ -195,7 +200,9 @@ if __name__ == "__main__":
 
         current_image = v1_path
         retry_cnt = 0
-        exclusion_list = []
+        global_memory = GlobalMemory()
+        last_used_ref = None
+
 
         best_score = -1.0
         best_image_path = current_image
@@ -233,7 +240,8 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cuda", method='Hybrid'
+                    k=50, device="cpu",
+                global_memory=global_memory, method='Hybrid'
                 )
                 candidates = retrieved_lists[0]
                 candidate_scores = retrieved_scores[0]
@@ -243,23 +251,20 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cuda"
+                    k=50, device="cpu",
+                global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
                 candidate_scores = retrieved_scores[0]
 
-            best_ref = None
-            best_ref_score = 0.0
-            for i, cand in enumerate(candidates):
-                if cand not in exclusion_list:
-                    best_ref = cand
-                    best_ref_score = candidate_scores[i]
-                    exclusion_list.append(cand)
-                    break
-
-            if not best_ref:
+            if not candidates:
                 f_log.write(">> No new references found in candidates.\n")
                 break
+
+            best_ref = candidates[0]
+            best_ref_score = candidate_scores[0]
+            global_memory.add(best_ref)
+            last_used_ref = best_ref
 
             # [Adaptive Guidance Scale]
             adaptive_scale = 1.0 + (best_ref_score * 5.0)
@@ -293,3 +298,15 @@ if __name__ == "__main__":
              shutil.copy(best_image_path, final_success_path)
 
         f_log.close()
+
+
+    # --- End of Class Loop ---
+    print("\n============================================")
+    print("All classes processed. Starting Global Memory Training...")
+    try:
+        # Re-initialize to ensure clean state and load all accumulated memory
+        trainer_memory = GlobalMemory()
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+    except Exception as e:
+        print(f"Error during training: {e}")
+    print("============================================")

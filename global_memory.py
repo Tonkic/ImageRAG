@@ -3,16 +3,21 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import clip
 from PIL import Image
+from tqdm import tqdm
+
+
+from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+from transformers.utils.import_utils import is_flash_attn_2_available
 
 class MemoryProjector(nn.Module):
     """
     A lightweight MLP to learn the mapping between Image+Text pairs and their validity (Match/Mismatch).
-    Input: Concatenated CLIP embeddings (Image + Text)
+    Input: Concatenated ColQwen embeddings (Pooled Image + Pooled Text)
+    Dimension: 128 (ColQwen) * 2 = 256
     Output: Probability of Match (0.0 - 1.0)
     """
-    def __init__(self, input_dim=512, hidden_dim=256):
+    def __init__(self, input_dim=128, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim * 2, hidden_dim),
@@ -23,7 +28,8 @@ class MemoryProjector(nn.Module):
         )
 
     def forward(self, img_emb, text_emb):
-        # Concatenate features: [Batch, 512] + [Batch, 512] -> [Batch, 1024]
+        # Concatenate features: [Batch, 128] + [Batch, 128] -> [Batch, 256]
+        # Ensure inputs are float32 for stability in MLP training
         x = torch.cat([img_emb, text_emb], dim=-1)
         return self.net(x)
 
@@ -34,18 +40,48 @@ class GlobalMemory:
         self.device = device
         self.memory = self._load_memory()
 
-        # Load CLIP for feature extraction (Frozen)
-        print("Loading CLIP for Global Memory...")
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device=device)
-        self.clip_model.eval()
+        # Initialize history for Taboo Search
+        self.history = set()
+        for entry in self.memory:
+            if 'image_path' in entry:
+                self.history.add(entry['image_path'])
+
+        # [Lazy Loading] Do not load ColQwen2.5 immediately to save VRAM
+        self.model = None
+        self.processor = None
+        self.model_name = "vidore/colqwen2.5-v0.2"
 
         # Initialize Small Trainable Model
-        self.projector = MemoryProjector().to(device)
+        # MLP input dimension is 128 (ColQwen vector dim)
+        self.projector = MemoryProjector(input_dim=128).to(device)
+
         if os.path.exists(model_path):
             print(f"Loading Global Memory Model from {model_path}")
-            self.projector.load_state_dict(torch.load(model_path))
+            try:
+                self.projector.load_state_dict(torch.load(model_path, map_location=device))
+            except RuntimeError:
+                print("⚠️  Warning: Saved model dimension mismatch (likely upgrading from CLIP to ColQwen). Initializing new model.")
+                # If mismatch, we start fresh but keep the JSON memory
         else:
             print("Initialized new Global Memory Model.")
+
+    def _load_colqwen(self):
+        """Lazy load ColQwen2.5 only when needed."""
+        if self.model is not None:
+            return
+
+        print("Loading ColQwen2.5 for Global Memory...")
+        try:
+            self.processor = ColQwen2_5_Processor.from_pretrained(self.model_name)
+            self.model = ColQwen2_5.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.bfloat16, # ColQwen standard dtype
+                device_map=self.device,
+                attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
+            ).eval()
+        except Exception as e:
+            print(f"Error loading ColQwen2.5: {e}")
+            raise e
 
     def _load_memory(self):
         if os.path.exists(self.memory_file):
@@ -57,18 +93,38 @@ class GlobalMemory:
         with open(self.memory_file, 'w') as f:
             json.dump(self.memory, f, indent=2)
 
+    def add(self, path):
+        """Add path to history for Taboo Search."""
+        self.history.add(path)
+
+    def __contains__(self, path):
+        return path in self.history
+
+    def re_rank(self, paths, scores, penalty=100.0):
+        """
+        Re-rank paths/scores by penalizing items in history.
+        """
+        combined = list(zip(paths, scores))
+        penalized = []
+        for p, s in combined:
+            if p in self.history:
+                s -= penalty
+            penalized.append((p, s))
+
+        # Re-sort descending
+        penalized.sort(key=lambda x: x[1], reverse=True)
+
+        if penalized:
+            new_paths, new_scores = zip(*penalized)
+            return list(new_paths), list(new_scores)
+        return [], []
+
     def add_feedback(self, image_path, prompt, actual_label=None, is_match=True):
         """
         Record feedback from the VLM/Critic.
-
-        Strategy:
-        1. If Match (is_match=True):
-           - Add Positive Sample: (Image, Prompt) -> Label 1
-        2. If Mismatch (is_match=False):
-           - Add Negative Sample: (Image, Prompt) -> Label 0
-           - If actual_label is provided, Add Positive Sample: (Image, "a photo of {actual_label}") -> Label 1
+        (Logic remains same as original)
         """
-        # 1. Record the direct feedback (Positive or Negative)
+        # 1. Record the direct feedback
         entry = {
             "image_path": image_path,
             "prompt": prompt,
@@ -77,10 +133,9 @@ class GlobalMemory:
             "timestamp": os.path.getmtime(image_path) if os.path.exists(image_path) else 0
         }
         self.memory.append(entry)
+        self.history.add(image_path) # Add to history for Taboo Search
 
-        # 2. If we have a correction (Mismatch + Actual Label), add the implicit positive
-        # Example: Prompt="707-320", Image=ImgA, Match=False, Actual="707-200"
-        # We add: (ImgA, "a photo of a 707-200") -> True (Label 1)
+        # 2. Implicit positive sample from correction
         if not is_match and actual_label:
             correction_prompt = f"a photo of a {actual_label}"
             self.memory.append({
@@ -93,10 +148,50 @@ class GlobalMemory:
 
         self._save_memory()
 
-    def train_model(self, epochs=10):
+    def _get_pooled_embedding(self, image_path=None, prompt_text=None):
         """
-        Train the small projector model on the collected memory.
-        Should be called periodically or after a batch of feedback.
+        Helper: Extract ColQwen embeddings and apply Mean Pooling.
+        Returns a float32 tensor of shape [1, 128] for the MLP.
+        """
+        self._load_colqwen() # Ensure model is loaded
+
+        with torch.no_grad():
+            if image_path:
+                try:
+                    image = Image.open(image_path).convert("RGB")
+                    # ColQwen processing
+                    batch = self.processor.process_images([image]).to(self.device)
+                    # Inference (bfloat16)
+                    # Output is a list of tensors (one per image), shape [N_patches, 128]
+                    emb = self.model(**batch)
+
+                    # [CORE LOGIC]: Mean Pooling -> [1, 128]
+                    # We pool along the patch dimension (dim=0)
+                    pooled = emb[0].mean(dim=0, keepdim=True).float()
+                    return pooled
+                except Exception as e:
+                    print(f"Error embedding image {image_path}: {e}")
+                    return None
+
+            if prompt_text:
+                try:
+                    batch = self.processor.process_queries([prompt_text]).to(self.device)
+                    # Output shape: [1, N_tokens, 128]
+                    emb = self.model(**batch)
+
+                    # [CORE LOGIC]: Mean Pooling -> [1, 128]
+                    # Pool along token dimension (dim=1) since batch is dim 0
+                    pooled = emb[0].mean(dim=0, keepdim=True).float()
+                    return pooled
+                except Exception as e:
+                    print(f"Error embedding text '{prompt_text}': {e}")
+                    return None
+
+        return None
+
+    def train_model(self, epochs=10, plot_path='global_memory_loss.png'):
+        """
+        Train the projector using pooled ColQwen embeddings.
         """
         if not self.memory:
             print("No memory to train on.")
@@ -104,80 +199,81 @@ class GlobalMemory:
 
         optimizer = optim.Adam(self.projector.parameters(), lr=1e-4)
         criterion = nn.BCELoss()
-
         self.projector.train()
 
-        # Prepare Batch
         img_embs = []
         txt_embs = []
         labels = []
 
-        print("Preparing training data from memory...")
+        print("Preparing training data from memory (ColQwen)...")
         valid_entries = 0
-        for entry in self.memory:
+
+        # Use tqdm to show progress as ColQwen inference is heavier than CLIP
+        for entry in tqdm(self.memory, desc="Encoding Memory"):
             if not os.path.exists(entry['image_path']): continue
 
-            try:
-                # Image Emb
-                img = self.preprocess(Image.open(entry['image_path']).convert("RGB")).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    img_emb = self.clip_model.encode_image(img).float()
-                    img_emb /= img_emb.norm(dim=-1, keepdim=True)
+            # Get pooled features
+            img_emb = self._get_pooled_embedding(image_path=entry['image_path'])
+            txt_emb = self._get_pooled_embedding(prompt_text=entry['prompt'])
 
-                # Text Emb
-                txt = clip.tokenize([entry['prompt']], truncate=True).to(self.device)
-                with torch.no_grad():
-                    txt_emb = self.clip_model.encode_text(txt).float()
-                    txt_emb /= txt_emb.norm(dim=-1, keepdim=True)
-
+            if img_emb is not None and txt_emb is not None:
                 img_embs.append(img_emb)
                 txt_embs.append(txt_emb)
                 labels.append(1.0 if entry['is_match'] else 0.0)
                 valid_entries += 1
-            except Exception as e:
-                # print(f"Error processing {entry}: {e}")
-                continue
 
         if not img_embs:
-            print("No valid images found in memory.")
+            print("No valid data found.")
             return
 
+        # Stack into batch tensors: [Batch, 128]
         img_embs = torch.cat(img_embs)
         txt_embs = torch.cat(txt_embs)
         labels = torch.tensor(labels, device=self.device).unsqueeze(1)
 
         print(f"Training Global Memory Model on {valid_entries} samples...")
+        loss_history = []
         for ep in range(epochs):
             optimizer.zero_grad()
             preds = self.projector(img_embs, txt_embs)
             loss = criterion(preds, labels)
             loss.backward()
             optimizer.step()
+            loss_history.append(loss.item())
             if (ep+1) % 5 == 0:
                 print(f"Epoch {ep+1}/{epochs}: Loss {loss.item():.4f}")
 
         torch.save(self.projector.state_dict(), self.model_path)
         print("Global Memory Model Updated.")
 
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(8, 5))
+            plt.plot(range(1, epochs + 1), loss_history, marker='o', linestyle='-', color='b')
+            plt.title('Global Memory MLP Training Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            plt.savefig(plot_path)
+            plt.close()
+            print(f"Loss plot saved to {plot_path}")
+        except ImportError:
+            print("matplotlib not found, skipping loss plot.")
+        except Exception as e:
+            print(f"Error plotting loss: {e}")
+
     def predict_score(self, image_path, prompt):
         """
-        Returns a score (0-1) indicating how likely the image matches the prompt
-        according to the global memory model.
+        Returns a score (0-1) indicating match probability.
         """
         self.projector.eval()
-        try:
-            img = self.preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0).to(self.device)
-            txt = clip.tokenize([prompt], truncate=True).to(self.device)
 
-            with torch.no_grad():
-                img_emb = self.clip_model.encode_image(img).float()
-                img_emb /= img_emb.norm(dim=-1, keepdim=True)
+        img_emb = self._get_pooled_embedding(image_path=image_path)
+        txt_emb = self._get_pooled_embedding(prompt_text=prompt)
 
-                txt_emb = self.clip_model.encode_text(txt).float()
-                txt_emb /= txt_emb.norm(dim=-1, keepdim=True)
+        if img_emb is None or txt_emb is None:
+            return 0.5 # Default neutral if error
 
-                score = self.projector(img_emb, txt_emb)
-                return score.item()
-        except Exception as e:
-            print(f"Prediction error: {e}")
-            return 0.5 # Default neutral
+        with torch.no_grad():
+            score = self.projector(img_emb, txt_emb)
+            return score.item()

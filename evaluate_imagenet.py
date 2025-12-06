@@ -261,9 +261,28 @@ def main():
             if method_name == "Baseline":
                 img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V1.png")
             else:
-                img_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_FINAL.png")
+                # Try to find FINAL, if not, fallback to highest V number
+                final_path = os.path.join(dir_path, f"{task['safe_filename_prefix']}_FINAL.png")
+                if os.path.exists(final_path):
+                    img_path = final_path
+                else:
+                    # Fallback logic: Find highest V number (up to V10)
+                    best_v_path = None
+                    for i in range(10, 1, -1): # Check V10 down to V2
+                        p = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V{i}.png")
+                        if os.path.exists(p):
+                            best_v_path = p
+                            break
 
-            if not os.path.exists(img_path):
+                    # If no V2-V10, check V1
+                    if not best_v_path:
+                        v1_p = os.path.join(dir_path, f"{task['safe_filename_prefix']}_V1.png")
+                        if os.path.exists(v1_p):
+                            best_v_path = v1_p
+
+                    img_path = best_v_path
+
+            if not img_path or not os.path.exists(img_path):
                 continue
 
             # Eval
