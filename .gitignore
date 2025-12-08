@@ -10,6 +10,7 @@ datasets/
 results/
 hf_cache/
 dinov3/
+Infinity/
 
 ILSVRC2012_img_train.tar
 
