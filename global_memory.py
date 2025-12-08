@@ -234,13 +234,13 @@ class GlobalMemory:
             loss_history.append(loss.item())
             if (ep+1) % 5 == 0:
                 print(f"Epoch {ep+1}/{epochs}: Loss {loss.item():.4f}")
-            if (ep+1) % 5 == 0:
-                print(f"Epoch {ep+1}/{epochs}: Loss {loss.item():.4f}")
 
         # torch.save(self.projector.state_dict(), self.model_path)
         print("Global Memory Model Updated (In-Memory).")
 
-        try:plt.figure(figsize=(8, 5))
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(8, 5))
             plt.plot(range(1, epochs + 1), loss_history, marker='o', linestyle='-', color='b')
             plt.title('Global Memory MLP Training Loss')
             plt.xlabel('Epoch')

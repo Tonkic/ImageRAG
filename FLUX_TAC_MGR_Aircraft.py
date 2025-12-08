@@ -1,18 +1,17 @@
 '''
-OmniGenV2_TAC_MGR_Aircraft.py
+FLUX_TAC_MGR_Aircraft.py
 =============================
 Configuration:
-  - Generator: OmniGen V2
+  - Generator: FLUX.1-dev
   - Critic: Taxonomy-Aware Critic (TAC) -> Fine-grained diagnosis
   - Retrieval: Memory-Guided Retrieval (MGR) -> Dynamic RAG with Exclusion List
   - Dataset: FGVC-Aircraft
 
 Usage:
-  python OmniGenV2_TAC_MGR_Aircraft.py \
+  python FLUX_TAC_MGR_Aircraft.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
-      --omnigen2_path ./OmniGen2 \
       --openai_api_key "sk-..." \
       --seed 42
 '''
@@ -20,40 +19,10 @@ Usage:
 import argparse
 import sys
 import os
-
-# --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + MGR (Aircraft)")
-
-# Core Config
-parser.add_argument("--device_id", type=int, required=True, help="GPU Device ID")
-parser.add_argument("--task_index", type=int, default=0)
-parser.add_argument("--total_chunks", type=int, default=1)
-
-# Paths
-parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
-parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
-parser.add_argument("--transformer_lora_path", type=str, default="OmniGen2-EditScore7B" if os.path.exists("OmniGen2-EditScore7B") else None)
-parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instruct")
-
-# Generation Params
-parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
-parser.add_argument("--max_retries", type=int, default=3)
-parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher for TAC logic
-parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-
-args = parser.parse_args()
-
-# Environment
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
-print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
-
 import json
 import shutil
 import numpy as np
 import torch
-print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 from PIL import Image
 from tqdm import tqdm
 import random
@@ -64,6 +33,34 @@ import clip
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # TAC Logic
 from memory_guided_retrieval import retrieve_img_per_caption
 from global_memory import GlobalMemory # MGR Logic
+from diffusers import FluxFillPipeline
+from diffusers.utils import load_image
+from PIL import Image, ImageDraw
+
+# --- 1. Argument Parsing ---
+parser = argparse.ArgumentParser(description="FLUX + TAC + MGR (Aircraft)")
+
+# Core Config
+parser.add_argument("--device_id", type=int, required=True, help="GPU Device ID")
+parser.add_argument("--task_index", type=int, default=0)
+parser.add_argument("--total_chunks", type=int, default=1)
+
+# Paths
+parser.add_argument("--openai_api_key", type=str, required=True)
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instruct")
+
+# Generation Params
+parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
+parser.add_argument("--max_retries", type=int, default=3)
+parser.add_argument("--text_guidance_scale", type=float, default=30.0) # FLUX Fill default
+parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+
+args = parser.parse_args()
+
+# Environment
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 
 # --- 2. Reproducibility (Seed Fix) ---
 def seed_everything(seed):
@@ -80,33 +77,14 @@ DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_MGR_Aircraft"
+    "output_path": "results/FLUX_TAC_MGR_Aircraft"
 }
 
 # --- 4. Setup System ---
 def setup_system():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.append(os.path.abspath(os.path.join(script_dir, args.omnigen2_path)))
-
-    try:
-        from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
-        pipe = OmniGen2Pipeline.from_pretrained(
-            args.omnigen2_model_path,
-            torch_dtype=torch.float16,
-            transformer_lora_path=args.transformer_lora_path,
-            trust_remote_code=True,
-            mllm_kwargs={"attn_implementation": "flash_attention_2"}
-        )
-        # Patch for AttributeError
-        if not hasattr(pipe.transformer, "enable_teacache"):
-            pipe.transformer.enable_teacache = False
-        pipe.vae.enable_tiling()
-        pipe.vae.enable_slicing()
-        pipe.to("cuda")
-    except ImportError:
-        print("Error: OmniGen2 not found.")
-        sys.exit(1)
-
+    print("Loading FLUX.1-Fill-dev...")
+    pipe = FluxFillPipeline.from_pretrained("black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16)
+    pipe.enable_model_cpu_offload() # Save VRAM
 
     client = openai.OpenAI(
         api_key=args.openai_api_key,
@@ -127,48 +105,60 @@ def load_retrieval_db():
     print(f"Loaded {len(paths)} images.")
     return paths
 
-def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None):
-    # Ensure list format
-    if isinstance(input_images, str):
-        input_images = [input_images]
+def run_flux(pipe, prompt, input_images, output_path, seed):
+    # FLUX Fill requires image + mask.
+    # If input_images (RAG) is provided, we use it as the base image.
+    # We create a mask that covers the center (e.g. 80%) to allow the model to regenerate the object
+    # while keeping the context/style from the border.
 
-    processed_imgs = []
-    for img in input_images:
-        try:
-            if isinstance(img, str): img = Image.open(img)
-            if img.mode != 'RGB': img = img.convert('RGB')
-            processed_imgs.append(img)
-        except: continue
+    generator = torch.Generator("cpu").manual_seed(seed)
+    clean_prompt = prompt.replace("<|image_1|>", "").strip()
 
-    # Deterministic Generator for this specific call
-    generator = torch.Generator(device="cuda").manual_seed(seed)
+    width, height = 1024, 1024
 
-    if img_guidance_scale is None:
-        img_guidance_scale = args.image_guidance_scale
+    if input_images and len(input_images) > 0:
+        # Use RAG image
+        rag_img_path = input_images[0]
+        if isinstance(rag_img_path, str):
+            base_image = load_image(rag_img_path)
+        else:
+            base_image = rag_img_path
 
-    pipe(
-        prompt=prompt,
-        input_images=processed_imgs,
-        height=1024, width=1024,
-        text_guidance_scale=args.text_guidance_scale,
-        image_guidance_scale=img_guidance_scale,
+        base_image = base_image.convert("RGB").resize((width, height))
+
+        # Create Mask: Mask the center 80%
+        mask = Image.new("L", (width, height), 0) # 0 = Keep
+        draw = ImageDraw.Draw(mask)
+        margin = int(width * 0.1) # 10% margin
+        draw.rectangle([margin, margin, width - margin, height - margin], fill=255) # 255 = Mask/Regenerate
+    else:
+        # No RAG image (Fallback): Create black image + Full Mask
+        # This effectively acts as T2I
+        base_image = Image.new("RGB", (width, height), (0, 0, 0))
+        mask = Image.new("L", (width, height), 255) # Mask everything
+
+    image = pipe(
+        prompt=clean_prompt,
+        image=base_image,
+        mask_image=mask,
+        height=height,
+        width=width,
+        guidance_scale=args.text_guidance_scale,
         num_inference_steps=50,
+        max_sequence_length=512,
         generator=generator
-    ).images[0].save(output_path)
-
-# --- 5. Main Loop ---
+    ).images[0]
+    image.save(output_path)# --- 5. Main Loop ---
 if __name__ == "__main__":
     # 1. Set Seed
     seed_everything(args.seed)
 
-    # 2. Load DB & Pre-calculate Embeddings (BEFORE loading OmniGen)
-    # This prevents OOM by using GPU for retrieval caching while it's free.
+    # 2. Load DB & Pre-calculate Embeddings (BEFORE loading FLUX)
     retrieval_db = load_retrieval_db()
 
     print("Pre-calculating/Loading retrieval embeddings on GPU...")
     try:
         # Run a dummy retrieval on the FULL database to force caching of all images
-        # We use device="cuda" here because OmniGen isn't loaded yet.
         retrieve_img_per_caption(
             ["warmup_query"],
             retrieval_db,
@@ -177,13 +167,12 @@ if __name__ == "__main__":
             device="cuda",
             method='Hybrid'
         )
-        # Clear GPU cache after retrieval model is done
         torch.cuda.empty_cache()
         print("Retrieval embeddings cached successfully.")
     except Exception as e:
         print(f"Warning during embedding caching: {e}")
 
-    # 3. Init OmniGen (Now safe to load large model)
+    # 3. Init FLUX
     pipe, client = setup_system()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
@@ -207,15 +196,14 @@ if __name__ == "__main__":
         v1_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V1.png")
 
         # [Optimization] Shared Baseline Logic
-        baseline_dir = "results/OmniGenV2_Baseline_Aircraft"
+        baseline_dir = "results/FLUX_Baseline_Aircraft"
         baseline_v1_path = os.path.join(baseline_dir, f"{safe_name}_V1.png")
 
         if not os.path.exists(v1_path):
             if os.path.exists(baseline_v1_path):
-                # print(f"Copying V1 from baseline: {baseline_v1_path}")
                 shutil.copy(baseline_v1_path, v1_path)
             else:
-                run_omnigen(pipe, prompt, [], v1_path, args.seed)
+                run_flux(pipe, prompt, [], v1_path, args.seed)
                 # Try to populate baseline
                 try:
                     os.makedirs(baseline_dir, exist_ok=True)
@@ -288,28 +276,26 @@ if __name__ == "__main__":
             # C. Generation Strategy
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
-            # Dynamic Guidance based on Taxonomy Score
+            # FLUX doesn't use image guidance scale in this T2I mode, but we log strategy
             if score < 6.0:
-                current_img_guidance = 2.5 # Fix Taxonomy
-                f_log.write(">> Strategy: Fix Taxonomy (High Image Guidance)\n")
+                f_log.write(">> Strategy: Fix Taxonomy (Prompt Refinement)\n")
             else:
-                current_img_guidance = 1.5 # Optimize Details
-                f_log.write(">> Strategy: Optimize Details (Balanced Guidance)\n")
+                f_log.write(">> Strategy: Optimize Details (Prompt Refinement)\n")
 
-            # Always use refined prompt + reference
-            gen_prompt = f"{refined_prompt}. Use reference image <|image_1|>."
-            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance)
+            # Use refined prompt. FLUX ignores reference image.
+            gen_prompt = refined_prompt
+            run_flux(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1)
 
             current_image = next_path
-            current_prompt = refined_prompt # Update prompt for next round
+            current_prompt = refined_prompt
             retry_cnt += 1
 
-        # Final Check for the last generated image if loop finished without success
+        # Final Check
         if not os.path.exists(final_success_path):
             f_log.write(f"\n--- Final Check (Last Generated) ---\n")
             # Evaluate the last image generated (current_image)
             if os.path.exists(current_image):
-                diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
+                diagnosis = taxonomy_aware_diagnosis(current_prompt, [current_image], client, args.llm_model)
                 score = diagnosis.get('score', 0)
                 f_log.write(f"Final Image Score: {score}\n")
                 if score > best_score:
@@ -324,11 +310,4 @@ if __name__ == "__main__":
 
     # --- End of Class Loop ---
     print("\n============================================")
-    print("All classes processed. Starting Global Memory Training...")
-    try:
-        # Re-initialize to ensure clean state and load all accumulated memory
-        trainer_memory = GlobalMemory()
-        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
-    except Exception as e:
-        print(f"Error during training: {e}")
-    print("============================================")
+    print("All classes processed.")

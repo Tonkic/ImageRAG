@@ -1,18 +1,20 @@
-# Git 仓库
+# 模型 Git 仓库
 OmniGen/
 OmniGen2/
 OmniGen2-EditScore7B/
 CLIP/
 Qwen-Image/
+dinov3/
+Infinity/
+flux/
+segment-anything/
+GroundingDINO/
 
 # 大型数据集和文件
 datasets/
 results/
-hf_cache/
-dinov3/
-Infinity/
-
 ILSVRC2012_img_train.tar
+hf_cache/
 
 # Python 缓存和日志
 __pycache__/
@@ -21,3 +23,4 @@ nohup.out
 
 # 旧版本代码
 oldcode/
+temp/
