@@ -43,7 +43,7 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
 
             if os.path.exists(cache_file):
                 # 加载缓存
-                data = torch.load(cache_file, map_location=device)
+                data = torch.load(cache_file, map_location=device, weights_only=True)
                 normalized_im_vectors = data['normalized_clip_embeddings']
                 # 校验缓存路径是否匹配 (可选)
                 final_bi_paths = data.get('paths', current_batch_paths)

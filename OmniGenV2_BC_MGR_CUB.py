@@ -36,7 +36,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=1)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=3.0)
+parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/cub")
 
 args = parser.parse_args()
@@ -190,12 +190,6 @@ if __name__ == "__main__":
         simple_name = class_name.split('.', 1)[-1].replace('_', ' ')
         safe_name = simple_name.replace(" ", "_").replace("/", "-")
         prompt = f"a photo of a {simple_name}"
-
-        # [新增功能] 断点续传：检查是否已经成功完成
-        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
-        if os.path.exists(final_success_path):
-            print(f"Skipping {safe_name}: Already finished successfully.")
-            continue
 
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")

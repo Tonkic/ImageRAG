@@ -35,7 +35,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=1)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=3.0)
+parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
 
 args = parser.parse_args()
@@ -97,9 +97,6 @@ def setup_system():
         print("Error: OmniGen2 not found.")
         sys.exit(1)
 
-    # os.environ.pop("http_proxy", None)
-    # os.environ.pop("https_proxy", None)
-    # os.environ.pop("all_proxy", None)
 
     client = openai.OpenAI(
         api_key=args.openai_api_key,
@@ -161,11 +158,6 @@ if __name__ == "__main__":
     for class_name in tqdm(my_classes):
         safe_name = class_name.replace(" ", "_").replace("/", "-")
         prompt = f"a photo of a {class_name}"
-
-        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
-        if os.path.exists(final_success_path):
-            print(f"Skipping {safe_name}: Already finished.")
-            continue
 
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")

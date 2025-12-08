@@ -44,7 +44,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=1)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=1.8)
+parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/imagenet")
 
 args = parser.parse_args()
@@ -170,11 +170,6 @@ if __name__ == "__main__":
         safe_name = f"{class_id}_{simple_name.replace(' ', '_').replace('/', '-')}"
         prompt = f"a photo of a {simple_name}"
 
-        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
-        if os.path.exists(final_success_path):
-            print(f"Skipping {safe_name}: Already finished successfully.")
-            continue
-
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")
         f_log.write(f"Prompt: {prompt}\n")
@@ -266,11 +261,8 @@ if __name__ == "__main__":
             global_memory.add(best_ref)
             last_used_ref = best_ref
 
-            # [Adaptive Guidance Scale]
-            adaptive_scale = 1.0 + (best_ref_score * 5.0)
-            adaptive_scale = max(1.8, min(adaptive_scale, 3.0))
 
-            f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f}) -> Adaptive Scale: {adaptive_scale:.2f}\n")
+            f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
 
             # 3. Generation
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
@@ -282,12 +274,11 @@ if __name__ == "__main__":
             if error_type in ["role_binding_error", "attribute_binding_error", "spatial_relation_error", "wrong_concept", "missing_object"]:
                 regen_prompt = f"{prompt}. Correct the {correction_instruction}. Use <|image_1|> as a visual reference."
                 f_log.write(f"Regen Prompt: {regen_prompt}\n")
-                run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=adaptive_scale)
+                run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=args.image_guidance_scale)
             else:
                 edit_prompt = f"Edit this image to fix {correction_instruction}. Reference style: <|image_1|>"
                 f_log.write(f"Edit Prompt: {edit_prompt}\n")
-                edit_scale = max(2.5, adaptive_scale)
-                run_omnigen(pipe, edit_prompt, [current_image, best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=edit_scale)
+                run_omnigen(pipe, edit_prompt, [current_image, best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=args.image_guidance_scale)
 
             current_image = next_path
             retry_cnt += 1

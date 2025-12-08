@@ -38,13 +38,14 @@ class GlobalMemory:
         self.memory_file = memory_file
         self.model_path = model_path
         self.device = device
-        self.memory = self._load_memory()
+        # self.memory = self._load_memory()
+        self.memory = [] # Always start fresh to ensure experiment independence
 
         # Initialize history for Taboo Search
         self.history = set()
-        for entry in self.memory:
-            if 'image_path' in entry:
-                self.history.add(entry['image_path'])
+        # for entry in self.memory:
+        #     if 'image_path' in entry:
+        #         self.history.add(entry['image_path'])
 
         # [Lazy Loading] Do not load ColQwen2.5 immediately to save VRAM
         self.model = None
@@ -55,15 +56,8 @@ class GlobalMemory:
         # MLP input dimension is 128 (ColQwen vector dim)
         self.projector = MemoryProjector(input_dim=128).to(device)
 
-        if os.path.exists(model_path):
-            print(f"Loading Global Memory Model from {model_path}")
-            try:
-                self.projector.load_state_dict(torch.load(model_path, map_location=device))
-            except RuntimeError:
-                print("⚠️  Warning: Saved model dimension mismatch (likely upgrading from CLIP to ColQwen). Initializing new model.")
-                # If mismatch, we start fresh but keep the JSON memory
-        else:
-            print("Initialized new Global Memory Model.")
+        # Always initialize new model to ensure experiment independence
+        print("Initialized new Global Memory Model (In-Memory Only).")
 
     def _load_colqwen(self):
         """Lazy load ColQwen2.5 only when needed."""
@@ -84,14 +78,12 @@ class GlobalMemory:
             raise e
 
     def _load_memory(self):
-        if os.path.exists(self.memory_file):
-            with open(self.memory_file, 'r') as f:
-                return json.load(f)
+        # Disabled for experiment independence
         return []
 
     def _save_memory(self):
-        with open(self.memory_file, 'w') as f:
-            json.dump(self.memory, f, indent=2)
+        # Disabled for experiment independence
+        pass
 
     def add(self, path):
         """Add path to history for Taboo Search."""
@@ -242,13 +234,13 @@ class GlobalMemory:
             loss_history.append(loss.item())
             if (ep+1) % 5 == 0:
                 print(f"Epoch {ep+1}/{epochs}: Loss {loss.item():.4f}")
+            if (ep+1) % 5 == 0:
+                print(f"Epoch {ep+1}/{epochs}: Loss {loss.item():.4f}")
 
-        torch.save(self.projector.state_dict(), self.model_path)
-        print("Global Memory Model Updated.")
+        # torch.save(self.projector.state_dict(), self.model_path)
+        print("Global Memory Model Updated (In-Memory).")
 
-        try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(8, 5))
+        try:plt.figure(figsize=(8, 5))
             plt.plot(range(1, epochs + 1), loss_history, marker='o', linestyle='-', color='b')
             plt.title('Global Memory MLP Training Loss')
             plt.xlabel('Epoch')

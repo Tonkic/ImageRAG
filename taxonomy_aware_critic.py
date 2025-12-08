@@ -50,9 +50,6 @@ def message_gpt(msg, client, image_paths=[], model="gpt-4o", context_msgs=[], im
     return res_text
 
 def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model):
-    """
-    SmartRAG V2.5: 增加了 Score 评分机制
-    """
     msg = f"""
     You are an expert diagnostic agent for Text-to-Image generation. Analyze the attached image against the prompt: "{prompt}".
 
