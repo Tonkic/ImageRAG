@@ -19,6 +19,12 @@ Usage:
 import argparse
 import sys
 import os
+# [Proxy Config] Clear system proxies for direct connection
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + SR (Aircraft)")
@@ -31,9 +37,9 @@ parser.add_argument("--total_chunks", type=int, default=1)
 # Paths
 parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
-parser.add_argument("--transformer_lora_path", type=str, default="OmniGen2-EditScore7B" if os.path.exists("OmniGen2-EditScore7B") else None)
+parser.add_argument("--transformer_lora_path", type=str, default=None)
 parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instruct") # SiliconFlow Default
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # SiliconFlow Default
 
 # Params
 parser.add_argument("--seed", type=int, default=0)
@@ -41,6 +47,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher guidance for composition
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
 
 args = parser.parse_args()
 
@@ -60,7 +67,7 @@ import clip
 
 # [IMPORTS]
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # The new Critic
-from static_retrieval import retrieve_img_per_caption      # The Static Retrieval logic
+from memory_guided_retrieval import retrieve_img_per_caption      # The Static Retrieval logic
 
 def seed_everything(seed):
     random.seed(seed)
@@ -87,10 +94,8 @@ def setup_system():
         from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
-            torch_dtype=torch.float16,
-            transformer_lora_path=args.transformer_lora_path,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True, # Required for custom code
-            mllm_kwargs={"attn_implementation": "flash_attention_2"}
         )
         # Patch for missing attribute
         if not hasattr(pipe.transformer, "enable_teacache"):
@@ -98,8 +103,10 @@ def setup_system():
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         pipe.to("cuda")
-    except ImportError:
-        print("Error: OmniGen2 not found.")
+    except ImportError as e:
+        print(f"Error: OmniGen2 not found. Details: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
     # os.environ.pop("http_proxy", None)
@@ -125,7 +132,7 @@ def load_db():
                 paths.append(img_path)
     return paths
 
-def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None):
+def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None, text_guidance_scale=None):
     if isinstance(input_images, str): input_images = [input_images]
 
     processed = []
@@ -139,11 +146,14 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
     if img_guidance_scale is None:
         img_guidance_scale = args.image_guidance_scale
 
+    if text_guidance_scale is None:
+        text_guidance_scale = args.text_guidance_scale
+
     pipe(
         prompt=prompt,
         input_images=processed,
         height=1024, width=1024,
-        text_guidance_scale=args.text_guidance_scale,
+        text_guidance_scale=text_guidance_scale,
         image_guidance_scale=img_guidance_scale,
         num_inference_steps=50,
         generator=gen
@@ -151,6 +161,9 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
 
 # --- 4. Main ---
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
+
     seed_everything(args.seed)
 
     # 1. Load DB & Pre-calculate Embeddings (Warmup)
@@ -163,7 +176,8 @@ if __name__ == "__main__":
             retrieval_db,
             embeddings_path=args.embeddings_path,
             k=1,
-            device="cuda"
+            device="cuda",
+            method=args.retrieval_method
         )
         torch.cuda.empty_cache()
         print("Retrieval embeddings cached successfully.")
@@ -242,11 +256,15 @@ if __name__ == "__main__":
             query = refined_prompt
             if len(query) > 300: query = query[:300]
 
+            # [Token Length Check]
+            from memory_guided_retrieval import check_token_length
+            check_token_length([query], device="cpu", method=args.retrieval_method)
+
             try:
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=1, device="cpu"
+                    k=1, device="cuda", method=args.retrieval_method
                 )
                 best_ref = retrieved_lists[0][0]
                 best_ref_score = retrieved_scores[0][0]
@@ -256,7 +274,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=1, device="cpu"
+                    k=1, device="cuda", method=args.retrieval_method
                 )
                 best_ref = retrieved_lists[0][0]
                 best_ref_score = retrieved_scores[0][0]
@@ -266,15 +284,18 @@ if __name__ == "__main__":
             # C. Generation Strategy
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
-            if score < 6.0:
-                current_img_guidance = 2.5
-                f_log.write(">> Strategy: Fix Taxonomy (High Image Guidance)\n")
-            else:
-                current_img_guidance = 1.5
-                f_log.write(">> Strategy: Optimize Details (Balanced Guidance)\n")
+            # [Modified] Unified Guidance Scale (Same as BC)
+            current_img_guidance = 1.5 # Fixed value as requested
+            current_text_guidance = args.text_guidance_scale
+            f_log.write(f">> Strategy: Unified Guidance (Image: {current_img_guidance}, Text: {current_text_guidance})\n")
 
-            gen_prompt = f"{refined_prompt}. Use reference image <|image_1|>."
-            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance)
+            # User Request: Use original_prompt + visual_keywords (refined_prompt)
+            if refined_prompt != prompt:
+                gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
+            else:
+                gen_prompt = f"{prompt}. Use reference image <|image_1|>."
+
+            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
 
             current_image = next_path
             retry_cnt += 1
@@ -296,3 +317,8 @@ if __name__ == "__main__":
                 shutil.copy(best_image_path, final_success_path)
 
         f_log.close()
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    with open(os.path.join(DATASET_CONFIG['output_path'], "time_elapsed.txt"), "w") as f:
+        f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")

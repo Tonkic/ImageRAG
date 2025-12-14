@@ -59,6 +59,7 @@ args = parser.parse_args()
 
 # Environment
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
 print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 
@@ -114,7 +115,7 @@ def run_flux(pipe, prompt, input_images, output_path, seed):
     generator = torch.Generator("cpu").manual_seed(seed)
     clean_prompt = prompt.replace("<|image_1|>", "").strip()
 
-    width, height = 1024, 1024
+    width, height = 512, 512
 
     if input_images and len(input_images) > 0:
         # Use RAG image

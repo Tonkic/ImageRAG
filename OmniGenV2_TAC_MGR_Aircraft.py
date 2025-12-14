@@ -20,6 +20,12 @@ Usage:
 import argparse
 import sys
 import os
+# [Proxy Config] Clear system proxies for direct connection
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + MGR (Aircraft)")
@@ -32,9 +38,9 @@ parser.add_argument("--total_chunks", type=int, default=1)
 # Paths
 parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
-parser.add_argument("--transformer_lora_path", type=str, default="OmniGen2-EditScore7B" if os.path.exists("OmniGen2-EditScore7B") else None)
+parser.add_argument("--transformer_lora_path", type=str, default=None)
 parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instruct")
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Generation Params
 parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
@@ -42,6 +48,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher for TAC logic
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
 
 args = parser.parse_args()
 
@@ -92,10 +99,8 @@ def setup_system():
         from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
-            torch_dtype=torch.float16,
-            transformer_lora_path=args.transformer_lora_path,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            mllm_kwargs={"attn_implementation": "flash_attention_2"}
         )
         # Patch for AttributeError
         if not hasattr(pipe.transformer, "enable_teacache"):
@@ -103,8 +108,10 @@ def setup_system():
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         pipe.to("cuda")
-    except ImportError:
-        print("Error: OmniGen2 not found.")
+    except ImportError as e:
+        print(f"Error: OmniGen2 not found. Details: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
@@ -127,7 +134,7 @@ def load_retrieval_db():
     print(f"Loaded {len(paths)} images.")
     return paths
 
-def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None):
+def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None, text_guidance_scale=None):
     # Ensure list format
     if isinstance(input_images, str):
         input_images = [input_images]
@@ -146,11 +153,14 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
     if img_guidance_scale is None:
         img_guidance_scale = args.image_guidance_scale
 
+    if text_guidance_scale is None:
+        text_guidance_scale = args.text_guidance_scale
+
     pipe(
         prompt=prompt,
         input_images=processed_imgs,
         height=1024, width=1024,
-        text_guidance_scale=args.text_guidance_scale,
+        text_guidance_scale=text_guidance_scale,
         image_guidance_scale=img_guidance_scale,
         num_inference_steps=50,
         generator=generator
@@ -158,6 +168,9 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
 
 # --- 5. Main Loop ---
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
+
     # 1. Set Seed
     seed_everything(args.seed)
 
@@ -175,7 +188,7 @@ if __name__ == "__main__":
             embeddings_path=args.embeddings_path,
             k=1,
             device="cuda",
-            method='Hybrid'
+            method=args.retrieval_method
         )
         # Clear GPU cache after retrieval model is done
         torch.cuda.empty_cache()
@@ -193,6 +206,9 @@ if __name__ == "__main__":
 
     my_classes = [c for i, c in enumerate(all_classes) if i % args.total_chunks == args.task_index]
     print(f"Processing {len(my_classes)} classes.")
+
+    # [Global Training Data Collector]
+    all_feedback_memory = []
 
     for class_name in tqdm(my_classes):
         safe_name = class_name.replace(" ", "_").replace("/", "-")
@@ -248,6 +264,13 @@ if __name__ == "__main__":
 
             f_log.write(f"Decision: Score {score} | Taxonomy: {taxonomy_status}\nCritique: {critique}\n")
 
+            # [MGR Feedback Loop]
+            if last_used_ref is not None:
+                # If score >= 6.0, we consider the reference "helpful/correct concept"
+                is_match = (score >= 6.0)
+                # global_memory.add_feedback(last_used_ref, current_prompt, is_match=is_match)
+                # f_log.write(f"  [MGR] Feedback recorded for {os.path.basename(last_used_ref)}: {'Match' if is_match else 'Mismatch'} (Score: {score})\n")
+
             # Update Best
             if score > best_score:
                 best_score = score
@@ -263,11 +286,15 @@ if __name__ == "__main__":
             query_text = " ".join(mgr_queries)
             if len(query_text) > 300: query_text = query_text[:300]
 
+            # [Token Length Check]
+            from memory_guided_retrieval import check_token_length
+            check_token_length([query_text], device="cpu", method=args.retrieval_method)
+
             try:
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query_text], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cpu", method='Hybrid',
+                    k=50, device="cuda", method=args.retrieval_method,
                     global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
@@ -283,25 +310,32 @@ if __name__ == "__main__":
             best_ref = candidates[0]
             best_ref_score = candidate_scores[0]
             global_memory.add(best_ref)
+            last_used_ref = best_ref
             f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
 
             # C. Generation Strategy
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
-            # Dynamic Guidance based on Taxonomy Score
-            if score < 6.0:
-                current_img_guidance = 2.5 # Fix Taxonomy
-                f_log.write(">> Strategy: Fix Taxonomy (High Image Guidance)\n")
-            else:
-                current_img_guidance = 1.5 # Optimize Details
-                f_log.write(">> Strategy: Optimize Details (Balanced Guidance)\n")
+            # [Modified] Unified Guidance Scale (Same as BC)
+            current_img_guidance = args.image_guidance_scale # 1.5
+            current_text_guidance = args.text_guidance_scale # 7.5
+            f_log.write(f">> Strategy: Unified Guidance (Image: {current_img_guidance}, Text: {current_text_guidance})\n")
 
             # Always use refined prompt + reference
-            gen_prompt = f"{refined_prompt}. Use reference image <|image_1|>."
-            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance)
+            # User Request: Use original_prompt + visual_keywords (refined_prompt)
+            if refined_prompt != prompt:
+                gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
+            else:
+                gen_prompt = f"{prompt}. Use reference image <|image_1|>."
+
+            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
 
             current_image = next_path
-            current_prompt = refined_prompt # Update prompt for next round
+            # Update prompt for next round (Keep the full context)
+            if refined_prompt != prompt:
+                current_prompt = f"{prompt}. {refined_prompt}"
+            else:
+                current_prompt = prompt
             retry_cnt += 1
 
         # Final Check for the last generated image if loop finished without success
@@ -322,13 +356,22 @@ if __name__ == "__main__":
 
         f_log.close()
 
+        # Collect memory from this session
+        all_feedback_memory.extend(global_memory.memory)
+
     # --- End of Class Loop ---
     print("\n============================================")
     print("All classes processed. Starting Global Memory Training...")
     try:
         # Re-initialize to ensure clean state and load all accumulated memory
         trainer_memory = GlobalMemory()
+        trainer_memory.memory = all_feedback_memory # Inject collected memory
         trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    with open(os.path.join(DATASET_CONFIG['output_path'], "time_elapsed.txt"), "w") as f:
+        f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")

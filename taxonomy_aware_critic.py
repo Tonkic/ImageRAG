@@ -4,26 +4,34 @@ import io
 import os
 from PIL import Image
 
+import time
+import random
+
 # --- Integrated Helper Functions ---
-def encode_image(image_path):
+def encode_image(image_path, max_size=1024):
     """
-    将图像文件编码为 base64 字符串。
+    将图像文件编码为 base64 字符串，并限制最大尺寸以避免 API 错误。
     """
     try:
         image = Image.open(image_path)
         if image.mode in ('RGBA', 'P'):
             image = image.convert('RGB')
+
+        # Resize if too large
+        if max(image.size) > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG")
+        image.save(buffer, format="JPEG", quality=85) # Compress slightly
         image_bytes = buffer.getvalue()
         return base64.b64encode(image_bytes).decode('utf-8')
     except Exception as e:
         print(f"Error processing image {image_path}: {e}")
         return None
 
-def message_gpt(msg, client, image_paths=[], model="gpt-4o", context_msgs=[], images_idx=-1, temperature=0):
+def message_gpt(msg, client, image_paths=[], model="gpt-4o", context_msgs=[], images_idx=-1, temperature=0, max_retries=5):
     """
-    向 VLM 发送消息的核心函数 (标准版)。
+    向 VLM 发送消息的核心函数 (带重试机制)。
     """
     messages = [{"role": "user",
                  "content": [{"type": "text", "text": msg}]
@@ -39,15 +47,25 @@ def message_gpt(msg, client, image_paths=[], model="gpt-4o", context_msgs=[], im
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
-    res = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        response_format={"type": "text"},
-        temperature=temperature
-    )
-
-    res_text = res.choices[0].message.content
-    return res_text
+    for attempt in range(max_retries):
+        try:
+            res = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "text"},
+                temperature=temperature
+            )
+            res_text = res.choices[0].message.content
+            return res_text
+        except Exception as e:
+            print(f"[API Error] Attempt {attempt+1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                print(f"Retrying in {wait_time:.2f} seconds...")
+                time.sleep(wait_time)
+            else:
+                print("Max retries reached. Returning empty string.")
+                return ""
 
 def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model):
     """

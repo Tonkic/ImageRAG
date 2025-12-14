@@ -11,9 +11,9 @@ def generate_file_list_with_limit(root_dir='.', output_file='project_structure.t
 
     # --- 配置项 ---
     # 1. 设置文件数量阈值。
-    FILE_COUNT_THRESHOLD = 20
+    FILE_COUNT_THRESHOLD = 50
     # 2. 新增：设置子目录数量阈值。
-    SUBDIR_COUNT_THRESHOLD = 15
+    SUBDIR_COUNT_THRESHOLD = 30
 
     # 3. 常见的需要忽略的目录
     IGNORED_DIRS = {'.git', '.vscode', '__pycache__', 'node_modules', '.idea', 'venv', '.next'}

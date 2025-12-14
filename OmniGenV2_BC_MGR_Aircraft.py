@@ -20,6 +20,12 @@ Usage:
 import argparse
 import sys
 import os
+# [Proxy Config] Clear system proxies for direct connection
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + BC + MGR (Aircraft)")
@@ -31,13 +37,14 @@ parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
 parser.add_argument("--transformer_lora_path", type=str, default=None)
 parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instruct") # Default for SiliconFlow
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # Default for SiliconFlow
 
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--max_retries", type=int, default=1)
+parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
 
 args = parser.parse_args()
 
@@ -85,10 +92,8 @@ def setup_system():
         from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
-            torch_dtype=torch.float16,
-            transformer_lora_path=args.transformer_lora_path,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            mllm_kwargs={"attn_implementation": "flash_attention_2"}
         )
         # 手动修补可能缺失的属性
         if not hasattr(pipe.transformer, "enable_teacache"):
@@ -96,8 +101,10 @@ def setup_system():
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         pipe.to("cuda")
-    except ImportError:
-        print("Error: OmniGen2 not found.")
+    except ImportError as e:
+        print(f"Error: OmniGen2 not found. Details: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     # os.environ.pop("http_proxy", None)
     # os.environ.pop("https_proxy", None)
@@ -152,6 +159,9 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed):
     ).images[0].save(output_path)
 
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
+
     seed_everything(args.seed)
 
     # 1. Load DB & Pre-calculate Embeddings (BEFORE loading OmniGen)
@@ -165,7 +175,8 @@ if __name__ == "__main__":
             retrieval_db,
             embeddings_path=args.embeddings_path,
             k=1,
-            device="cuda"
+            device="cuda",
+            method=args.retrieval_method
         )
         torch.cuda.empty_cache()
         print("Retrieval embeddings cached successfully.")
@@ -191,6 +202,8 @@ if __name__ == "__main__":
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")
         f_log.write(f"Prompt: {prompt}\n")
+
+        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
 
         # --- Phase 1: Initial Generation ---
         v1_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V1.png")
@@ -234,8 +247,9 @@ if __name__ == "__main__":
             # [MGR Feedback Loop]
             if last_used_ref is not None:
                 is_match = (status == 'success')
-                global_memory.add_feedback(last_used_ref, prompt, is_match=is_match)
-                print(f"  [MGR] Feedback recorded for {os.path.basename(last_used_ref)}: {'Match' if is_match else 'Mismatch'}")
+                # Only record feedback, do NOT exclude from future retrieval
+                # global_memory.add_feedback(last_used_ref, prompt, is_match=is_match)
+                # print(f"  [MGR] Feedback recorded for {os.path.basename(last_used_ref)}: {'Match' if is_match else 'Mismatch'}")
 
             if status == 'success':
                 f_log.write(">> Success!\n")
@@ -245,10 +259,15 @@ if __name__ == "__main__":
             # 2. Retrieval (MGR)
             # [关键修复] static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
             # [Fix] Use device="cpu" to avoid OOM
+
+            # [Token Length Check]
+            from memory_guided_retrieval import check_token_length
+            check_token_length([prompt], device="cpu", method=args.retrieval_method)
+
             retrieved_lists, _ = retrieve_img_per_caption(
                 [prompt], retrieval_db,
                 embeddings_path=args.embeddings_path,
-                k=50, device="cpu",
+                k=50, device="cuda", method=args.retrieval_method,
                 global_memory=global_memory
             )
 
@@ -260,14 +279,14 @@ if __name__ == "__main__":
                 break
 
             best_ref = candidates[0]
-            global_memory.add(best_ref)
+            # global_memory.add(best_ref) # Do NOT exclude
             last_used_ref = best_ref
 
             f_log.write(f">> Ref: {best_ref}\n")
 
             # 3. Generation
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
-            regen_prompt = f"{prompt}. Use this image as a reference: <|image_1|>."
+            regen_prompt = f"{prompt}. Use reference image <|image_1|>."
 
             # [关键修复] 必须将 best_ref 放入列表 [best_ref] 中传递
             # 即使 run_omnigen 里加了 check，这里写对也是好习惯
@@ -294,3 +313,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    with open(os.path.join(DATASET_CONFIG['output_path'], "time_elapsed.txt"), "w") as f:
+        f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")

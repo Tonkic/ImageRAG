@@ -12,25 +12,50 @@ from transformers.utils.import_utils import is_flash_attn_2_available
 
 class MemoryProjector(nn.Module):
     """
-    A lightweight MLP to learn the mapping between Image+Text pairs and their validity (Match/Mismatch).
-    Input: Concatenated ColQwen embeddings (Pooled Image + Pooled Text)
-    Dimension: 128 (ColQwen) * 2 = 256
+    A Cross-Attention based module to learn the mapping between Image+Text pairs and their validity.
+    Input: ColQwen embeddings (Pooled Image + Pooled Text)
+    Dimension: 128 (ColQwen)
     Output: Probability of Match (0.0 - 1.0)
     """
-    def __init__(self, input_dim=128, hidden_dim=256):
+    def __init__(self, input_dim=128, hidden_dim=256, num_heads=4):
         super().__init__()
+
+        # Cross Attention: Query=Text, Key=Image, Value=Image
+        self.cross_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
+
+        # MLP Head
+        # Input: Text + Image + Attended_Text -> 128 * 3
         self.net = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
+            nn.Linear(input_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
 
+        # Store attention weights for visualization
+        self.last_attn_weights = None
+
     def forward(self, img_emb, text_emb):
-        # Concatenate features: [Batch, 128] + [Batch, 128] -> [Batch, 256]
-        # Ensure inputs are float32 for stability in MLP training
-        x = torch.cat([img_emb, text_emb], dim=-1)
+        # Inputs: [Batch, 128]
+        # Reshape to [Batch, 1, 128] for Attention
+        img_seq = img_emb.unsqueeze(1)
+        text_seq = text_emb.unsqueeze(1)
+
+        # Cross Attention: Text attends to Image
+        # Query: Text, Key: Image, Value: Image
+        # attn_output: [Batch, 1, 128]
+        # attn_weights: [Batch, 1, 1]
+        attn_out, attn_weights = self.cross_attn(query=text_seq, key=img_seq, value=img_seq)
+
+        self.last_attn_weights = attn_weights
+
+        # Squeeze back to [Batch, 128]
+        attn_out = attn_out.squeeze(1)
+
+        # Concatenate: Original Text + Original Image + Attended Features
+        x = torch.cat([text_emb, img_emb, attn_out], dim=-1)
+
         return self.net(x)
 
 class GlobalMemory:
@@ -189,7 +214,7 @@ class GlobalMemory:
             print("No memory to train on.")
             return
 
-        optimizer = optim.Adam(self.projector.parameters(), lr=1e-4)
+        optimizer = optim.Adam(self.projector.parameters(), lr=1e-3)
         criterion = nn.BCELoss()
         self.projector.train()
 
@@ -240,6 +265,8 @@ class GlobalMemory:
 
         try:
             import matplotlib.pyplot as plt
+
+            # Plot 1: Loss Curve
             plt.figure(figsize=(8, 5))
             plt.plot(range(1, epochs + 1), loss_history, marker='o', linestyle='-', color='b')
             plt.title('Global Memory MLP Training Loss')
@@ -249,6 +276,25 @@ class GlobalMemory:
             plt.savefig(plot_path)
             plt.close()
             print(f"Loss plot saved to {plot_path}")
+
+            # Plot 2: Cross Attention Weights (if available)
+            # We visualize the attention weights from the last batch of the last epoch
+            if self.projector.last_attn_weights is not None:
+                attn_weights = self.projector.last_attn_weights.detach().cpu().numpy()
+                # attn_weights shape: [Batch, 1, 1] -> flatten to [Batch]
+                attn_weights = attn_weights.flatten()
+
+                attn_plot_path = plot_path.replace("loss.png", "attn_weights.png")
+                plt.figure(figsize=(10, 5))
+                plt.hist(attn_weights, bins=20, color='orange', alpha=0.7)
+                plt.title('Distribution of Cross-Attention Weights (Last Batch)')
+                plt.xlabel('Attention Weight')
+                plt.ylabel('Frequency')
+                plt.grid(True)
+                plt.savefig(attn_plot_path)
+                plt.close()
+                print(f"Attention weights plot saved to {attn_plot_path}")
+
         except ImportError:
             print("matplotlib not found, skipping loss plot.")
         except Exception as e:

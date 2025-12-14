@@ -105,7 +105,7 @@ def run_flux(pipe, prompt, input_images, output_path, seed):
     generator = torch.Generator("cpu").manual_seed(seed)
     clean_prompt = prompt.replace("<|image_1|>", "").strip()
 
-    width, height = 1024, 1024
+    width, height = 512, 512
 
     if input_images and len(input_images) > 0:
         rag_img_path = input_images[0]
