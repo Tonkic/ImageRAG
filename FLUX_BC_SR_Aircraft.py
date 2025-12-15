@@ -53,6 +53,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=30.0)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -213,7 +214,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=1, device="cpu"
+                    k=1, device="cuda", method=args.retrieval_method
                 )
                 best_ref = retrieved_lists[0][0]
                 best_ref_score = retrieved_scores[0][0]

@@ -6,6 +6,16 @@ import torch.nn.functional as F
 from PIL import Image
 import numpy as np
 
+# [Optional] Long-CLIP Imports
+import sys
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Long-CLIP'))
+try:
+    from model import longclip
+    LONGCLIP_AVAILABLE = True
+except ImportError:
+    LONGCLIP_AVAILABLE = False
+    print("Warning: Long-CLIP not found.")
+
 # [Optional] ColPali Imports
 try:
     from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
@@ -547,6 +557,17 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
+        elif method == 'LongCLIP':
+            paths, scores = get_longclip_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device
+            )
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+            all_retrieved_paths.append(paths)
+            all_retrieved_scores.append(scores)
+
         else:
             print(f"Unknown method {method}, falling back to CLIP")
             paths, scores = get_clip_similarities(
@@ -562,3 +583,90 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             all_retrieved_scores.append(scores)
 
     return all_retrieved_paths, all_retrieved_scores
+def get_longclip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0'):
+    """
+    Long-CLIP Retrieval Logic
+    """
+    if not LONGCLIP_AVAILABLE:
+        print("Long-CLIP not available.")
+        return [], []
+
+    # Load Long-CLIP Model
+    ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Long-CLIP/checkpoints/longclip-L.pt')
+    if not os.path.exists(ckpt_path):
+        print(f"Long-CLIP checkpoint not found at {ckpt_path}")
+        return [], []
+
+    model, preprocess = longclip.load(ckpt_path, device=device)
+    model.eval()
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    text_features_list = []
+    with torch.no_grad():
+        for p in prompts:
+            # Long-CLIP supports up to 248 tokens. We truncate if longer.
+            text = longclip.tokenize([p], truncate=True).to(device)
+            feat = model.encode_text(text)
+            text_features_list.append(feat)
+
+        text_features = torch.cat(text_features_list, dim=0)
+        normalized_text_vectors = F.normalize(text_features, p=2, dim=1)
+
+        all_scores = []
+        all_paths = []
+
+        for bi in range(0, len(image_paths), bs):
+            cache_file = os.path.join(embeddings_path, f"longclip_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            if os.path.exists(cache_file):
+                data = torch.load(cache_file, map_location=device, weights_only=False)
+                normalized_im_vectors = data['normalized_clip_embeddings']
+                final_bi_paths = data.get('paths', current_batch_paths)
+            else:
+                images = []
+                valid_paths = []
+                for path in current_batch_paths:
+                    try:
+                        img_pil = Image.open(path).convert("RGB")
+                        image = preprocess(img_pil).unsqueeze(0).to(device)
+                        images.append(image)
+                        valid_paths.append(path)
+                    except Exception as e:
+                        print(f"Warning: Could not read {path}: {e}")
+                        continue
+
+                if not images: continue
+
+                images = torch.stack(images).squeeze(1)
+                image_features = model.encode_image(images)
+                normalized_im_vectors = F.normalize(image_features, p=2, dim=1)
+                final_bi_paths = valid_paths
+
+                if embeddings_path:
+                    os.makedirs(embeddings_path, exist_ok=True)
+                    torch.save({
+                        "normalized_clip_embeddings": normalized_im_vectors,
+                        "paths": final_bi_paths
+                    }, cache_file)
+
+            normalized_im_vectors = normalized_im_vectors.to(normalized_text_vectors.dtype)
+            sim_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
+            all_scores.append(sim_matrix.cpu().numpy())
+            all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+    single_prompt_scores = full_scores[0]
+
+    k = min(k, len(single_prompt_scores))
+    top_indices = np.argsort(single_prompt_scores)[-k:][::-1]
+
+    top_paths = [all_paths[i] for i in top_indices]
+    top_scores = single_prompt_scores[top_indices].tolist()
+
+    return top_paths, top_scores

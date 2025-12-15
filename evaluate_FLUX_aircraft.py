@@ -18,6 +18,21 @@ Metrics:
 import os
 import sys
 import argparse
+
+# --------------------------------------------------
+# --- 1. Args (Parse BEFORE importing torch) ---
+# --------------------------------------------------
+parser = argparse.ArgumentParser(description="Evaluate Aircraft (FLUX Methods)")
+parser.add_argument("--device_id", type=int, default=0)
+parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
+parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
+
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
 import random
 import numpy as np
 from tqdm import tqdm
@@ -32,18 +47,6 @@ import open_clip
 from open_clip import create_model_from_pretrained, get_tokenizer
 from torchmetrics.image.kid import KernelInceptionDistance
 
-# --------------------------------------------------
-# --- 1. Args ---
-# --------------------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate Aircraft (FLUX Methods)")
-parser.add_argument("--device_id", type=int, default=0)
-parser.add_argument("--batch_size", type=int, default=32)
-parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
-parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
-
-args = parser.parse_args()
-
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
@@ -87,7 +90,14 @@ def load_models(device):
 
         # [Fix] Add missing class expected by dinov3
         class DatasetWithEnumeratedTargets: pass
+        class SamplerType: pass
+        class ImageDataAugmentation: pass
+        def make_data_loader(*args, **kwargs): pass
+
         mock_data.DatasetWithEnumeratedTargets = DatasetWithEnumeratedTargets
+        mock_data.SamplerType = SamplerType
+        mock_data.ImageDataAugmentation = ImageDataAugmentation
+        mock_data.make_data_loader = make_data_loader
 
         mock_data.datasets = mock_datasets
         sys.modules["dinov3.data"] = mock_data

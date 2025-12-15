@@ -54,6 +54,7 @@ parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=30.0) # FLUX Fill default
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -256,7 +257,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query_text], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cpu", method='Hybrid',
+                    k=50, device="cuda", method=args.retrieval_method,
                     global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
@@ -266,7 +267,18 @@ if __name__ == "__main__":
                 candidates = []
 
             if not candidates:
-                f_log.write(">> No references found.\n")
+                f_log.write(">> No references found. Proceeding without reference.\n")
+                # Fallback: Generate without reference
+                next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
+
+                # Use refined prompt but no image
+                gen_prompt = refined_prompt
+                run_flux(pipe, gen_prompt, [], next_path, args.seed + retry_cnt + 1)
+
+                current_image = next_path
+                current_prompt = refined_prompt
+                retry_cnt += 1
+                continue
                 break
 
             best_ref = candidates[0]

@@ -45,7 +45,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen2.5-VL-32B-Instru
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -256,8 +256,15 @@ if __name__ == "__main__":
                         break
 
             if not best_ref:
-                f_log.write("No suitable images retrieved (all excluded or empty).\n")
-                break
+                f_log.write("No suitable images retrieved (all excluded or empty). Proceeding without reference.\n")
+                # Fallback: Generate without reference
+                next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
+
+                run_zimage(pipe, prompt, [], next_path, args.seed + retry_cnt + 1)
+
+                current_image = next_path
+                retry_cnt += 1
+                continue
 
             f_log.write(f">> MGR Ref: {best_ref}\n")
             last_used_ref = best_ref

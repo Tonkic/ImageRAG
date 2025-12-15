@@ -43,7 +43,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -159,6 +159,16 @@ if __name__ == "__main__":
     pipe, client = setup_system()
     retrieval_db = load_retrieval_db()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
+
+    # Save Run Configuration
+    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    with open(config_path, "w") as f:
+        f.write("Run Configuration:\n")
+        f.write("==================\n")
+        for arg in vars(args):
+            f.write(f"{arg}: {getattr(args, arg)}\n")
+        f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+
 
     with open(DATASET_CONFIG['classes_txt'], 'r') as f:
         all_classes = [line.strip() for line in f.readlines() if line.strip()]

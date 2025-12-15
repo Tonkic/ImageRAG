@@ -48,7 +48,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher for TAC logic
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -200,6 +200,16 @@ if __name__ == "__main__":
     pipe, client = setup_system()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Save Run Configuration
+    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    with open(config_path, "w") as f:
+        f.write("Run Configuration:\n")
+        f.write("==================\n")
+        for arg in vars(args):
+            f.write(f"{arg}: {getattr(args, arg)}\n")
+        f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+
+
     # 4. Load Tasks
     with open(DATASET_CONFIG['classes_txt'], 'r') as f:
         all_classes = [line.strip() for line in f.readlines() if line.strip()]
@@ -304,8 +314,20 @@ if __name__ == "__main__":
                 candidates = []
 
             if not candidates:
-                f_log.write(">> No references found.\n")
-                break
+                f_log.write(">> No references found. Proceeding without reference.\n")
+                # Fallback: Generate without reference
+                next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
+
+                # Use refined prompt but no image
+                gen_prompt = refined_prompt
+                run_omnigen(pipe, gen_prompt, [], next_path, args.seed + retry_cnt + 1,
+                           img_guidance_scale=args.image_guidance_scale,
+                           text_guidance_scale=args.text_guidance_scale)
+
+                current_image = next_path
+                current_prompt = refined_prompt
+                retry_cnt += 1
+                continue
 
             best_ref = candidates[0]
             best_ref_score = candidate_scores[0]

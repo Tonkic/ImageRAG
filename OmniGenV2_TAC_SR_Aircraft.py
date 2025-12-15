@@ -47,7 +47,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher guidance for composition
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="Hybrid", choices=["CLIP", "Hybrid", "ColPali"])
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -188,6 +188,16 @@ if __name__ == "__main__":
     # retrieval_db = load_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Save Run Configuration
+    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    with open(config_path, "w") as f:
+        f.write("Run Configuration:\n")
+        f.write("==================\n")
+        for arg in vars(args):
+            f.write(f"{arg}: {getattr(args, arg)}\n")
+        f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+
+
     with open(DATASET_CONFIG['classes_txt']) as f:
         all_classes = [l.strip() for l in f.readlines() if l.strip()]
 
@@ -274,7 +284,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=1, device="cuda", method=args.retrieval_method
+                    k=1, device="cuda:0", method=args.retrieval_method
                 )
                 best_ref = retrieved_lists[0][0]
                 best_ref_score = retrieved_scores[0][0]

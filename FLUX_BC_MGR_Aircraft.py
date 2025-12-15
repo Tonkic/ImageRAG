@@ -54,6 +54,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=30.0)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -152,7 +153,7 @@ if __name__ == "__main__":
             embeddings_path=args.embeddings_path,
             k=1,
             device="cuda",
-            method='Hybrid'
+            method=args.retrieval_method
         )
         torch.cuda.empty_cache()
         print("Retrieval embeddings cached successfully.")
@@ -223,7 +224,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [prompt], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cpu", method='Hybrid',
+                    k=50, device="cuda:0", method=args.retrieval_method,
                     global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
