@@ -217,11 +217,20 @@ if __name__ == "__main__":
         global_memory = GlobalMemory()
         last_used_ref = None
 
+        # [Knowledge Retrieval] - Sanity Check
+        from taxonomy_aware_critic import retrieve_knowledge
+        try:
+            reference_specs = retrieve_knowledge(class_name, client, args.llm_model)
+            f_log.write(f"Reference Specs: {reference_specs}\n")
+        except Exception as e:
+            f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
+            reference_specs = None
+
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
             # 1. Critic (TAC)
-            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
+            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
 
             score = diagnosis.get('final_score', 0)
             taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
@@ -246,10 +255,12 @@ if __name__ == "__main__":
                 global_memory.add_negative(prompt, last_used_ref)
 
             # 2. Retrieval (MGR)
-            check_token_length([prompt], device="cpu", method=args.retrieval_method)
+            # Force Class Name injection
+            query_text = f"{class_name} {class_name}. {prompt}"
+            check_token_length([query_text], device="cpu", method=args.retrieval_method)
 
             retrieved_lists, _ = retrieve_img_per_caption(
-                [prompt], retrieval_db,
+                [query_text], retrieval_db,
                 embeddings_path=args.embeddings_path,
                 k=5, device="cuda", method=args.retrieval_method
             )
@@ -300,7 +311,8 @@ if __name__ == "__main__":
     print("All classes processed. Starting Global Memory Training...")
     try:
         trainer_memory = GlobalMemory()
-        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+        os.makedirs(os.path.join(DATASET_CONFIG['output_path'], "logs"), exist_ok=True)
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")

@@ -13,6 +13,7 @@ segment-anything-2/
 Grounded-SAM-2/
 Z-Image-Turbo/
 Long-CLIP/
+sam2/
 
 # 大型数据集和文件
 datasets/

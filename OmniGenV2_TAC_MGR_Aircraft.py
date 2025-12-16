@@ -20,12 +20,6 @@ Usage:
 import argparse
 import sys
 import os
-# [Proxy Config] Clear system proxies for direct connection
-os.environ.pop("HTTP_PROXY", None)
-os.environ.pop("HTTPS_PROXY", None)
-os.environ.pop("http_proxy", None)
-os.environ.pop("https_proxy", None)
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + MGR (Aircraft)")
@@ -159,7 +153,7 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
     pipe(
         prompt=prompt,
         input_images=processed_imgs,
-        height=1024, width=1024,
+        height=512, width=512,
         text_guidance_scale=text_guidance_scale,
         image_guidance_scale=img_guidance_scale,
         num_inference_steps=50,
@@ -200,8 +194,12 @@ if __name__ == "__main__":
     pipe, client = setup_system()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Create logs directory
+    logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
     # Save Run Configuration
-    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    config_path = os.path.join(logs_dir, "run_config.txt")
     with open(config_path, "w") as f:
         f.write("Run Configuration:\n")
         f.write("==================\n")
@@ -260,11 +258,21 @@ if __name__ == "__main__":
         best_score = -1
         best_image_path = None
 
+        # [Knowledge Retrieval] - Sanity Check
+        # Retrieve specs once per class to guide the critic
+        from taxonomy_aware_critic import retrieve_knowledge
+        try:
+            reference_specs = retrieve_knowledge(class_name, client, args.llm_model)
+            f_log.write(f"Reference Specs: {reference_specs}\n")
+        except Exception as e:
+            f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
+            reference_specs = None
+
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
             # A. TAC Diagnosis
-            diagnosis = taxonomy_aware_diagnosis(current_prompt, [current_image], client, args.llm_model)
+            diagnosis = taxonomy_aware_diagnosis(current_prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
 
             score = diagnosis.get('final_score', 0)
             taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
@@ -273,6 +281,7 @@ if __name__ == "__main__":
             mgr_queries = diagnosis.get('retrieval_queries', [class_name])
 
             f_log.write(f"Decision: Score {score} | Taxonomy: {taxonomy_status}\nCritique: {critique}\n")
+            f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
 
             # [MGR Feedback Loop]
             if last_used_ref is not None:
@@ -293,7 +302,8 @@ if __name__ == "__main__":
 
             # B. Memory-Guided Retrieval
             # Use the specific queries from TAC
-            query_text = " ".join(mgr_queries)
+            # Force Class Name injection
+            query_text = f"{class_name} {class_name}. " + " ".join(mgr_queries)
             if len(query_text) > 300: query_text = query_text[:300]
 
             # [Token Length Check]
@@ -388,7 +398,7 @@ if __name__ == "__main__":
         # Re-initialize to ensure clean state and load all accumulated memory
         trainer_memory = GlobalMemory()
         trainer_memory.memory = all_feedback_memory # Inject collected memory
-        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")

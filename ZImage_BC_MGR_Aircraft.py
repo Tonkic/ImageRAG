@@ -292,7 +292,8 @@ if __name__ == "__main__":
     print("All classes processed. Starting Global Memory Training...")
     try:
         trainer_memory = GlobalMemory()
-        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+        os.makedirs(os.path.join(DATASET_CONFIG['output_path'], "logs"), exist_ok=True)
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")

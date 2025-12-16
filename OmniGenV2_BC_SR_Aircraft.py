@@ -144,7 +144,7 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed):
     pipe(
         prompt=prompt,
         input_images=processed_imgs,
-        height=1024, width=1024,
+        height=512, width=512,
         text_guidance_scale=args.text_guidance_scale,
         image_guidance_scale=args.image_guidance_scale,
         num_inference_steps=50,
@@ -160,8 +160,12 @@ if __name__ == "__main__":
     retrieval_db = load_retrieval_db()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Create logs directory
+    logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
     # Save Run Configuration
-    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    config_path = os.path.join(logs_dir, "run_config.txt")
     with open(config_path, "w") as f:
         f.write("Run Configuration:\n")
         f.write("==================\n")
@@ -220,6 +224,7 @@ if __name__ == "__main__":
 
             status = diagnosis.get('status')
             f_log.write(f"Decision: {status}\n")
+            f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
 
             if status == 'success':
                 f_log.write(">> Success!\n")

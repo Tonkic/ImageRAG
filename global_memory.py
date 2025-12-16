@@ -117,7 +117,7 @@ class GlobalMemory:
     def __contains__(self, path):
         return path in self.history
 
-    def re_rank(self, paths, scores, penalty=100.0):
+    def re_rank(self, paths, scores, penalty=0.05):
         """
         Re-rank paths/scores by penalizing items in history.
         """

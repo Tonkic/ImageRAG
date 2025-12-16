@@ -152,7 +152,7 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
     pipe(
         prompt=prompt,
         input_images=processed,
-        height=1024, width=1024,
+        height=512, width=512,
         text_guidance_scale=text_guidance_scale,
         image_guidance_scale=img_guidance_scale,
         num_inference_steps=50,
@@ -188,8 +188,12 @@ if __name__ == "__main__":
     # retrieval_db = load_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Create logs directory
+    logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
     # Save Run Configuration
-    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    config_path = os.path.join(logs_dir, "run_config.txt")
     with open(config_path, "w") as f:
         f.write("Run Configuration:\n")
         f.write("==================\n")
@@ -238,12 +242,21 @@ if __name__ == "__main__":
         best_score = -1
         best_image_path = None
 
+        # [Knowledge Retrieval] - Sanity Check
+        from taxonomy_aware_critic import retrieve_knowledge
+        try:
+            reference_specs = retrieve_knowledge(class_name, client, args.llm_model)
+            f_log.write(f"Reference Specs: {reference_specs}\n")
+        except Exception as e:
+            f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
+            reference_specs = None
+
         # Loop (Static Retrieval = No Exclusion List)
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
             # A. TAC Diagnosis (V4.0)
-            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
+            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
 
             score = diagnosis.get('final_score', 0)
             taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
@@ -251,6 +264,7 @@ if __name__ == "__main__":
             refined_prompt = diagnosis.get('refined_prompt', prompt)
 
             f_log.write(f"Decision: Score {score} | Taxonomy: {taxonomy_status}\nCritique: {critique}\n")
+            f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
 
             # Update Best
             if score > best_score:
@@ -263,7 +277,7 @@ if __name__ == "__main__":
                 break
 
             # B. Static Retrieval (Simplified for SR)
-            query = refined_prompt
+            query = f"{class_name} {class_name}. {refined_prompt}"
             if len(query) > 300: query = query[:300]
 
             # [Token Length Check]

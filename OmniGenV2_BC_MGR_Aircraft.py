@@ -95,7 +95,6 @@ def setup_system():
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
-        # 手动修补可能缺失的属性
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
         pipe.vae.enable_tiling()
@@ -106,9 +105,6 @@ def setup_system():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-    # os.environ.pop("http_proxy", None)
-    # os.environ.pop("https_proxy", None)
-    # os.environ.pop("all_proxy", None)
     client = openai.OpenAI(
         api_key=args.openai_api_key,
         base_url="https://api.siliconflow.cn/v1/"
@@ -129,12 +125,9 @@ def load_retrieval_db():
     return paths
 
 def run_omnigen(pipe, prompt, input_images, output_path, seed):
-    # -------------------------------------------------
     # [关键修复] 防止字符串路径被当做字符列表遍历
-    # -------------------------------------------------
     if isinstance(input_images, str):
         input_images = [input_images]
-    # -------------------------------------------------
 
     processed_imgs = []
     for img in input_images:
@@ -151,7 +144,7 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed):
     pipe(
         prompt=prompt,
         input_images=processed_imgs,
-        height=1024, width=1024,
+        height=512, width=512,
         text_guidance_scale=args.text_guidance_scale,
         image_guidance_scale=args.image_guidance_scale,
         num_inference_steps=50,
@@ -187,8 +180,12 @@ if __name__ == "__main__":
     # retrieval_db = load_retrieval_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
+    # Create logs directory
+    logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
     # Save Run Configuration
-    config_path = os.path.join(DATASET_CONFIG['output_path'], "run_config.txt")
+    config_path = os.path.join(logs_dir, "run_config.txt")
     with open(config_path, "w") as f:
         f.write("Run Configuration:\n")
         f.write("==================\n")
@@ -244,8 +241,6 @@ if __name__ == "__main__":
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
             # 1. Critic (Binary)
-            # 注意：这里调用的是 binary_critic，它内部会处理 API 超时重试（如果你修改了的话）
-            # 如果没修改 message_gpt，它可能会因为网络波动报错，但逻辑上是对的
             diagnosis = retrieval_caption_generation(
                 prompt, [current_image],
                 gpt_client=client, model=args.llm_model
@@ -253,6 +248,7 @@ if __name__ == "__main__":
 
             status = diagnosis.get('status')
             f_log.write(f"Decision: {status}\n")
+            f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
 
             # [MGR Feedback Loop]
             if last_used_ref is not None:
@@ -267,15 +263,16 @@ if __name__ == "__main__":
                 break
 
             # 2. Retrieval (MGR)
-            # [关键修复] static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
-            # [Fix] Use device="cpu" to avoid OOM
+            # static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
 
             # [Token Length Check]
             from memory_guided_retrieval import check_token_length
-            check_token_length([prompt], device="cpu", method=args.retrieval_method)
+            # Force Class Name injection
+            query_text = f"{class_name} {class_name}. {prompt}"
+            check_token_length([query_text], device="cpu", method=args.retrieval_method)
 
             retrieved_lists, _ = retrieve_img_per_caption(
-                [prompt], retrieval_db,
+                [query_text], retrieval_db,
                 embeddings_path=args.embeddings_path,
                 k=50, device="cuda", method=args.retrieval_method,
                 global_memory=global_memory
@@ -328,7 +325,7 @@ if __name__ == "__main__":
     try:
         # Re-initialize to ensure clean state and load all accumulated memory
         trainer_memory = GlobalMemory()
-        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "memory_loss.png"))
+        trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")
     print("============================================")

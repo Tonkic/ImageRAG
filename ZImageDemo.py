@@ -61,8 +61,8 @@ def main():
 
     image = pipe(
         prompt=args.prompt,
-        height=1024,
-        width=1024,
+        height=512,
+        width=512,
         num_inference_steps=9,  # Turbo 专属步数
         guidance_scale=0.0,     # Turbo 专属 CFG
         generator=generator,
