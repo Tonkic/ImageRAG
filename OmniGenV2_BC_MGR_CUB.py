@@ -1,14 +1,14 @@
 '''
-OmniGenV2_BC_MGR_Aircraft.py
+OmniGenV2_BC_MGR_CUB.py
 =============================
 Configuration:
   - Generator: OmniGen V2
   - Critic: Binary Critic (BC)
   - Retrieval: Memory-Guided Retrieval (MGR)
-  - Dataset: FGVC-Aircraft
+  - Dataset: CUB-200-2011 (Birds)
 
 Usage:
-  python OmniGenV2_BC_MGR_Aircraft.py \
+  python OmniGenV2_BC_MGR_CUB.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
@@ -28,7 +28,7 @@ os.environ.pop("https_proxy", None)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + BC + MGR (Aircraft)")
+parser = argparse.ArgumentParser(description="OmniGenV2 + BC + MGR (CUB)")
 
 parser.add_argument("--device_id", type=int, required=True)
 parser.add_argument("--task_index", type=int, default=0)
@@ -37,13 +37,13 @@ parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
 parser.add_argument("--transformer_lora_path", type=str, default=None)
 parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # Default for SiliconFlow
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
-parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/cub")
 parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
@@ -62,11 +62,10 @@ from tqdm import tqdm
 import openai
 import clip
 
-# ------------------------------------------------------------------
-from binary_critic import retrieval_caption_generation  # Critic
-from memory_guided_retrieval import retrieve_img_per_caption
-from global_memory import GlobalMemory # Retrieval
-# ------------------------------------------------------------------
+# [IMPORTS]
+from binary_critic import retrieval_caption_generation
+from memory_guided_retrieval import retrieve_img_per_caption, check_token_length
+from global_memory import GlobalMemory
 
 def seed_everything(seed):
     random.seed(seed)
@@ -78,10 +77,10 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 DATASET_CONFIG = {
-    "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
-    "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
-    "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_BC_MGR_Aircraft"
+    "classes_txt": "datasets/CUB_200_2011/classes.txt",
+    "train_list": "datasets/CUB_200_2011/train_test_split.txt",
+    "image_root": "datasets/CUB_200_2011/images",
+    "output_path": "results/OmniGenV2_BC_MGR_CUB"
 }
 
 def setup_system():
@@ -93,7 +92,7 @@ def setup_system():
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
+            trust_remote_code=True
         )
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
@@ -102,67 +101,78 @@ def setup_system():
         pipe.to("cuda")
     except ImportError as e:
         print(f"Error: OmniGen2 not found. Details: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
+
+    print("Initializing OpenAI Client for SiliconFlow...")
     client = openai.OpenAI(
         api_key=args.openai_api_key,
         base_url="https://api.siliconflow.cn/v1/"
     )
     return pipe, client
 
-def load_retrieval_db():
-    print(f"Loading Aircraft Retrieval DB...")
-    paths = []
+def load_db():
+    print("Loading CUB DB...")
+    train_ids = set()
     with open(DATASET_CONFIG['train_list'], 'r') as f:
-        for line in f.readlines():
-            line = line.strip()
-            if not line: continue
-            img_path = os.path.join(DATASET_CONFIG['image_root'], f"{line}.jpg")
-            if os.path.exists(img_path):
-                paths.append(img_path)
-    print(f"Loaded {len(paths)} images.")
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == '1':
+                train_ids.add(parts[0])
+
+    paths = []
+    images_txt = os.path.join(os.path.dirname(DATASET_CONFIG['image_root']), "images.txt")
+
+    with open(images_txt, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                img_id = parts[0]
+                rel_path = parts[1]
+                if img_id in train_ids:
+                    full_path = os.path.join(DATASET_CONFIG['image_root'], rel_path)
+                    if os.path.exists(full_path):
+                        paths.append(full_path)
+    print(f"Loaded {len(paths)} training images.")
     return paths
 
-def run_omnigen(pipe, prompt, input_images, output_path, seed):
-    # [关键修复] 防止字符串路径被当做字符列表遍历
-    if isinstance(input_images, str):
-        input_images = [input_images]
+def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None, text_guidance_scale=None):
+    if isinstance(input_images, str): input_images = [input_images]
 
-    processed_imgs = []
+    processed = []
     for img in input_images:
-        try:
-            if isinstance(img, str): img = Image.open(img)
-            if img.mode != 'RGB': img = img.convert('RGB')
-            processed_imgs.append(img)
-        except Exception as e:
-            print(f"Error loading image: {e}")
-            continue
+        if isinstance(img, str): img = Image.open(img)
+        if img.mode != 'RGB': img = img.convert('RGB')
+        processed.append(img)
 
-    generator = torch.Generator(device="cuda").manual_seed(seed)
+    gen = torch.Generator("cuda").manual_seed(seed)
+
+    if img_guidance_scale is None:
+        img_guidance_scale = args.image_guidance_scale
+
+    if text_guidance_scale is None:
+        text_guidance_scale = args.text_guidance_scale
 
     pipe(
         prompt=prompt,
-        input_images=processed_imgs,
+        input_images=processed,
         height=512, width=512,
-        text_guidance_scale=args.text_guidance_scale,
-        image_guidance_scale=args.image_guidance_scale,
+        text_guidance_scale=text_guidance_scale,
+        image_guidance_scale=img_guidance_scale,
         num_inference_steps=50,
-        generator=generator
+        generator=gen
     ).images[0].save(output_path)
 
+# --- Main ---
 if __name__ == "__main__":
     import time
     start_time = time.time()
 
     seed_everything(args.seed)
 
-    # 1. Load DB & Pre-calculate Embeddings (BEFORE loading OmniGen)
-    retrieval_db = load_retrieval_db()
+    # 1. Load DB & Pre-calculate Embeddings
+    retrieval_db = load_db()
     print("Pre-calculating/Loading retrieval embeddings on GPU...")
     try:
-        # Run a dummy retrieval on the FULL database to force caching
-        # BC_MGR uses default method='CLIP'
         retrieve_img_per_caption(
             ["warmup_query"],
             retrieval_db,
@@ -177,7 +187,6 @@ if __name__ == "__main__":
         print(f"Warning during embedding caching: {e}")
 
     pipe, client = setup_system()
-    # retrieval_db = load_retrieval_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     # Create logs directory
@@ -193,40 +202,44 @@ if __name__ == "__main__":
             f.write(f"{arg}: {getattr(args, arg)}\n")
         f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
 
+    # Load Classes
+    with open(DATASET_CONFIG['classes_txt']) as f:
+        all_classes = []
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                raw_name = parts[1]
+                if '.' in raw_name:
+                    raw_name = raw_name.split('.', 1)[1]
+                all_classes.append(raw_name)
 
-    # 加载类别列表
-    with open(DATASET_CONFIG['classes_txt'], 'r') as f:
-        all_classes = [line.strip() for line in f.readlines() if line.strip()]
+    my_tasks = [c for i, c in enumerate(all_classes) if i % args.total_chunks == args.task_index]
+    print(f"Processing {len(my_tasks)} classes.")
 
-    # 任务分片
-    my_classes = [c for i, c in enumerate(all_classes) if i % args.total_chunks == args.task_index]
-    print(f"Processing {len(my_classes)} classes.")
+    all_feedback_memory = []
 
-    for class_name in tqdm(my_classes):
-        safe_name = class_name.replace(" ", "_").replace("/", "-")
-        prompt = f"a photo of a {class_name}"
+    for class_name_raw in tqdm(my_tasks):
+        class_name = class_name_raw.replace("_", " ")
+        safe_name = class_name_raw
+        prompt = f"a photo of a {class_name}, a type of bird"
 
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
+        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
         f_log = open(log_file, "w")
         f_log.write(f"Prompt: {prompt}\n")
 
-        final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
-
-        # --- Phase 1: Initial Generation ---
+        # Phase 1: Initial
         v1_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V1.png")
 
         # [Optimization] Shared Baseline Logic
-        baseline_dir = "results/OmniGenV2_Baseline_Aircraft"
+        baseline_dir = "results/OmniGenV2_Baseline_CUB"
         baseline_v1_path = os.path.join(baseline_dir, f"{safe_name}_V1.png")
 
         if not os.path.exists(v1_path):
             if os.path.exists(baseline_v1_path):
-                # print(f"Copying V1 from baseline: {baseline_v1_path}")
                 shutil.copy(baseline_v1_path, v1_path)
             else:
-                # 注意：run_omnigen 内部我们之前加了保护，这里传空列表 [] 也是安全的
                 run_omnigen(pipe, prompt, [], v1_path, args.seed)
-                # Try to populate baseline
                 try:
                     os.makedirs(baseline_dir, exist_ok=True)
                     shutil.copy(v1_path, baseline_v1_path)
@@ -234,39 +247,34 @@ if __name__ == "__main__":
 
         current_image = v1_path
         retry_cnt = 0
+
+        # [MGR Core]
         global_memory = GlobalMemory()
         last_used_ref = None
 
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
-            # 1. Critic (Binary)
-            diagnosis = retrieval_caption_generation(
-                prompt, [current_image],
-                gpt_client=client, model=args.llm_model
-            )
+            # 1. Binary Critic
+            diagnosis = retrieval_caption_generation(prompt, [current_image], client, args.llm_model)
+            status = diagnosis.get('status', 'fail')
+            critique = diagnosis.get('critique', '')
+            refined_prompt = diagnosis.get('refined_prompt', prompt)
 
-            status = diagnosis.get('status')
             f_log.write(f"Decision: {status}\n")
             f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
 
             # [MGR Feedback Loop]
             if last_used_ref is not None:
                 is_match = (status == 'success')
-                # Only record feedback, do NOT exclude from future retrieval
                 # global_memory.add_feedback(last_used_ref, prompt, is_match=is_match)
-                # print(f"  [MGR] Feedback recorded for {os.path.basename(last_used_ref)}: {'Match' if is_match else 'Mismatch'}")
 
             if status == 'success':
                 f_log.write(">> Success!\n")
-                shutil.copy(current_image, final_success_path) # 复制为 FINAL.png
+                shutil.copy(current_image, final_success_path)
                 break
 
             # 2. Retrieval (MGR)
-            # static_retrieval 返回的是一个列表的列表，不能拆包成 paths, scores
-
-            # [Token Length Check]
-            from memory_guided_retrieval import check_token_length
             # Force Class Name injection
             query_text = f"{class_name} {class_name}. {prompt}"
             check_token_length([query_text], device="cpu", method=args.retrieval_method)
@@ -278,53 +286,61 @@ if __name__ == "__main__":
                 global_memory=global_memory
             )
 
-            # 获取第一个 prompt 的候选列表 (retrieved_lists[0] 是路径列表)
             candidates = retrieved_lists[0]
 
             if not candidates:
                 f_log.write(">> No new references found in candidates. Proceeding without reference.\n")
-                # Fallback: Generate without reference
                 next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
-
                 run_omnigen(pipe, prompt, [], next_path, args.seed + retry_cnt + 1,
                            img_guidance_scale=args.image_guidance_scale,
                            text_guidance_scale=args.text_guidance_scale)
-
                 current_image = next_path
                 retry_cnt += 1
                 continue
 
             best_ref = candidates[0]
-            # global_memory.add(best_ref) # Do NOT exclude
+            global_memory.add(best_ref)
             last_used_ref = best_ref
-
             f_log.write(f">> Ref: {best_ref}\n")
 
             # 3. Generation
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
-            regen_prompt = f"{prompt}. Use reference image <|image_1|>."
 
-            # [关键修复] 必须将 best_ref 放入列表 [best_ref] 中传递
-            # 即使 run_omnigen 里加了 check，这里写对也是好习惯
-            run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1)
+            current_img_guidance = 1.5
+            current_text_guidance = args.text_guidance_scale
+            f_log.write(f">> Strategy: Unified Guidance (Image: {current_img_guidance}, Text: {current_text_guidance})\n")
+
+            if refined_prompt != prompt:
+                gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
+            else:
+                gen_prompt = f"{prompt}. Use reference image <|image_1|>."
+
+            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
 
             current_image = next_path
             retry_cnt += 1
 
+        # Final Check
         if not os.path.exists(final_success_path):
             f_log.write(f"\n--- Final Check (Last Generated) ---\n")
-            f_log.write(f">> Loop finished. Saving last image to FINAL.\n")
             if os.path.exists(current_image):
-                shutil.copy(current_image, final_success_path)
+                diagnosis = retrieval_caption_generation(prompt, [current_image], client, args.llm_model)
+                status = diagnosis.get('status', 'fail')
+                if status == 'success':
+                    f_log.write(">> Success!\n")
+                    shutil.copy(current_image, final_success_path)
+                else:
+                    f_log.write(">> Failed after retries. Saving last image as FINAL.\n")
+                    shutil.copy(current_image, final_success_path)
 
         f_log.close()
+        all_feedback_memory.extend(global_memory.memory)
 
-    # --- End of Class Loop ---
     print("\n============================================")
     print("All classes processed. Starting Global Memory Training...")
     try:
-        # Re-initialize to ensure clean state and load all accumulated memory
         trainer_memory = GlobalMemory()
+        trainer_memory.memory = all_feedback_memory
         trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
         print(f"Error during training: {e}")

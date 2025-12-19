@@ -1,0 +1,427 @@
+'''
+Evaluation Script for CUB-200-2011 (All Methods)
+=======================================================
+Methods Evaluated:
+  1. Baseline (V1) - Shared
+  2. BC + SR
+  3. BC + MGR
+  4. TAC + SR
+  5. TAC + MGR
+
+Metrics:
+  - CLIP Score
+  - SigLIP Score
+  - DINO v1/v2/v3 (Image Fidelity)
+  - KID (Kernel Inception Distance)
+'''
+
+import os
+import sys
+import argparse
+
+# --------------------------------------------------
+# --- 1. Args (Parse BEFORE importing torch) ---
+# --------------------------------------------------
+parser = argparse.ArgumentParser(description="Evaluate CUB (All Methods)")
+parser.add_argument("--device_id", type=int, default=0)
+parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
+parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
+
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import random
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+from collections import defaultdict
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as T
+
+import open_clip
+from open_clip import create_model_from_pretrained, get_tokenizer
+from torchmetrics.image.kid import KernelInceptionDistance
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# --------------------------------------------------
+# --- Config ---
+# --------------------------------------------------
+DATASET_CONFIG = {
+    "classes_txt": "datasets/CUB_200_2011/classes.txt",
+    "images_txt": "datasets/CUB_200_2011/images.txt",
+    "image_class_labels": "datasets/CUB_200_2011/image_class_labels.txt",
+    "train_test_split": "datasets/CUB_200_2011/train_test_split.txt",
+    "image_root": "datasets/CUB_200_2011/images",
+}
+
+METHODS = {
+    "Baseline": "results/OmniGenV2_Baseline_CUB",
+    "BC_SR": "results/OmniGenV2_BC_SR_CUB",
+    "BC_MGR": "results/OmniGenV2_BC_MGR_CUB",
+    "TAC_SR": "results/OmniGenV2_TAC_SR_CUB",
+    "TAC_MGR": "results/OmniGenV2_TAC_MGR_CUB"
+}
+
+# --------------------------------------------------
+# --- 2. Model Loader ---
+# --------------------------------------------------
+def load_models(device):
+    models = {}
+    models['dino_transform'] = T.Compose([
+        T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(224),
+        T.ToTensor(),
+        T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+    # 1. DINO v3
+    print(f"Loading DINO v3...")
+    sys.path.append(args.dinov3_repo_path)
+    try:
+        # Mock dinov3.data.datasets to avoid ImportError
+        import types
+        mock_data = types.ModuleType("dinov3.data")
+        mock_datasets = types.ModuleType("dinov3.data.datasets")
+
+        # [Fix] Add missing class expected by dinov3
+        class DatasetWithEnumeratedTargets: pass
+        class SamplerType: pass
+        class ImageDataAugmentation: pass
+        def make_data_loader(*args, **kwargs): pass
+
+        mock_data.DatasetWithEnumeratedTargets = DatasetWithEnumeratedTargets
+        mock_data.SamplerType = SamplerType
+        mock_data.ImageDataAugmentation = ImageDataAugmentation
+        mock_data.make_data_loader = make_data_loader
+
+        mock_data.datasets = mock_datasets
+        sys.modules["dinov3.data"] = mock_data
+        sys.modules["dinov3.data.datasets"] = mock_datasets
+
+        # Load model structure from local repo
+        models['dino_v3'] = torch.hub.load(args.dinov3_repo_path, 'dinov3_vitb16', source='local', pretrained=False)
+
+        # Load weights from specified path
+        print(f"  Loading weights from: {args.dinov3_weights_path}")
+        ckpt = torch.load(args.dinov3_weights_path, map_location='cpu')
+
+        # Handle different checkpoint formats (teacher/student/model)
+        state_dict = ckpt.get('model', ckpt.get('teacher', ckpt))
+
+        # Clean up state dict keys
+        new_state_dict = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+        models['dino_v3'].load_state_dict(new_state_dict, strict=False)
+        models['dino_v3'] = models['dino_v3'].to(device).eval()
+    except Exception as e:
+        print(f"Error loading DINO v3: {e}")
+        sys.exit(1)
+
+    # 2. DINO v2
+    print("Loading DINO v2...")
+    models['dino_v2'] = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device).eval()
+
+    # 3. DINO v1
+    print("Loading DINO v1...")
+    models['dino_v1'] = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16').to(device).eval()
+
+    # 4. CLIP
+    print("Loading CLIP...")
+    models['clip_model'], _, models['clip_preprocess'] = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    models['clip_model'] = models['clip_model'].eval().to(device)
+    models['clip_tokenizer'] = open_clip.get_tokenizer("ViT-B-32")
+
+    # 5. SigLIP
+    print("Loading SigLIP...")
+    sig_name = 'hf-hub:timm/ViT-SO400M-14-SigLIP-384'
+    models['siglip_model'], models['siglip_preprocess'] = create_model_from_pretrained(sig_name, device=device)
+    models['siglip_model'] = models['siglip_model'].eval().to(device)
+    models['siglip_tokenizer'] = get_tokenizer(sig_name)
+
+    # 6. KID (One per method)
+    print("Initializing KID...")
+    models['kid'] = {}
+    for m in METHODS.keys():
+        # Reduced subset_size to 5 to allow calculation with fewer samples
+        models['kid'][m] = KernelInceptionDistance(subset_size=5, normalize=True).to(device)
+
+    models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
+
+    return models
+
+# --------------------------------------------------
+# --- 3. Data Loader ---
+# --------------------------------------------------
+def load_cub_tasks(config):
+    print("Loading CUB Task List...")
+    tasks = []
+
+    # 1. Load Test Split IDs
+    test_ids = set()
+    with open(config['train_test_split'], 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == '0': # 0 is test
+                test_ids.add(parts[0])
+
+    # 2. Map Image ID to Class ID
+    image_id_to_class_id = {}
+    with open(config['image_class_labels'], 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                image_id_to_class_id[parts[0]] = parts[1]
+
+    # 3. Map Class ID to Class Name
+    class_id_to_name = {}
+    with open(config['classes_txt'], 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                # 1 001.Black_footed_Albatross
+                class_id_to_name[parts[0]] = parts[1]
+
+    # 4. Collect Real Images per Class
+    class_real_images = defaultdict(list)
+    with open(config['images_txt'], 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                img_id = parts[0]
+                rel_path = parts[1]
+
+                if img_id in test_ids:
+                    cid = image_id_to_class_id.get(img_id)
+                    if cid:
+                        full_path = os.path.join(config['image_root'], rel_path)
+                        if os.path.exists(full_path):
+                            class_real_images[cid].append(full_path)
+
+    # 5. Create Tasks
+    sorted_cids = sorted(class_id_to_name.keys(), key=lambda x: int(x))
+
+    for cid in sorted_cids:
+        raw_name = class_id_to_name[cid]
+        # Clean name for prompt: 001.Black_footed_Albatross -> Black footed Albatross
+        if '.' in raw_name:
+            clean_name = raw_name.split('.', 1)[1].replace('_', ' ')
+            safe_name = raw_name.split('.', 1)[1] # Matches generation script safe_name
+        else:
+            clean_name = raw_name.replace('_', ' ')
+            safe_name = raw_name
+
+        tasks.append({
+            "prompt": f"a photo of a {clean_name}, a type of bird",
+            "safe_filename_prefix": safe_name,
+            "real_image_paths": class_real_images[cid]
+        })
+
+    return tasks
+
+# --------------------------------------------------
+# --- 4. Evaluation Logic ---
+# --------------------------------------------------
+def get_best_image_path(method_name, dir_path, safe_filename_prefix):
+    if method_name == "Baseline":
+        img_path = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+    else:
+        # Try to find FINAL, if not, fallback to highest V number
+        final_path = os.path.join(dir_path, f"{safe_filename_prefix}_FINAL.png")
+        if os.path.exists(final_path):
+            img_path = final_path
+        else:
+            # Fallback logic: Find highest V number (up to V10)
+            best_v_path = None
+            for i in range(10, 1, -1): # Check V10 down to V2
+                p = os.path.join(dir_path, f"{safe_filename_prefix}_V{i}.png")
+                if os.path.exists(p):
+                    best_v_path = p
+                    break
+
+            # If no V2-V10, check V1
+            if not best_v_path:
+                v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+                if os.path.exists(v1_p):
+                    best_v_path = v1_p
+
+            img_path = best_v_path
+
+    if img_path and os.path.exists(img_path):
+        return img_path
+    return None
+
+def get_dino_features_batch(paths, model, transform, device, batch_size=32):
+    feats = []
+    eval_paths = paths[:50]
+    for i in range(0, len(eval_paths), batch_size):
+        batch_paths = eval_paths[i:i+batch_size]
+        batch_imgs = []
+        for p in batch_paths:
+            try: batch_imgs.append(transform(Image.open(p).convert("RGB")))
+            except: pass
+        if not batch_imgs: continue
+        batch_tensor = torch.stack(batch_imgs).to(device)
+        with torch.no_grad():
+            out = model(batch_tensor)
+            feats.append(out)
+    if not feats: return None
+    return F.normalize(torch.cat(feats, dim=0), dim=-1)
+
+def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
+    scores = {}
+    try:
+        img = Image.open(img_path).convert("RGB")
+        with torch.no_grad():
+            # DINO
+            dino_in = models['dino_transform'](img).unsqueeze(0).to(device)
+            for ver in ['v1', 'v2', 'v3']:
+                out = models[f'dino_{ver}'](dino_in)
+                out = F.normalize(out, dim=-1)
+                scores[f'dino{ver}_base'] = F.cosine_similarity(out, real_feats_map[ver]).mean().item()
+
+            # CLIP
+            c_in = models['clip_preprocess'](img).unsqueeze(0).to(device)
+            c_feat = models['clip_model'].encode_image(c_in)
+            c_feat /= c_feat.norm(dim=-1, keepdim=True)
+            scores['clip'] = (c_feat @ txt_feats['clip'].T).item()
+
+            # SigLIP
+            s_in = models['siglip_preprocess'](img).unsqueeze(0).to(device)
+            s_feat = models['siglip_model'].encode_image(s_in)
+            s_feat = F.normalize(s_feat, dim=-1)
+            scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
+    except Exception as e:
+        # print(f"Error evaluating {img_path}: {e}")
+        return None
+    return scores
+
+# --------------------------------------------------
+# --- 5. Main ---
+# --------------------------------------------------
+def main():
+    seed = 0
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # 1. Load Tasks First (Fast)
+    tasks = load_cub_tasks(DATASET_CONFIG)
+
+    # 2. Pre-scan Counts
+    print(f"\nScanning generated images for {len(tasks)} tasks...")
+    counts = {m: 0 for m in METHODS.keys()}
+    for task in tasks:
+        for method_name, dir_path in METHODS.items():
+            if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
+                counts[method_name] += 1
+
+    print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
+    for m in METHODS.keys():
+        print(f"    - {m:<15}: {counts[m]}")
+    print("-" * 80)
+
+    models = load_models(device)
+
+    # Storage for results
+    results = {m: [] for m in METHODS.keys()}
+
+    print(f"\nStarting evaluation on {len(tasks)} CUB classes...")
+
+    for task in tqdm(tasks):
+        # 1. Get Real Features
+        real_paths = task["real_image_paths"]
+        if not real_paths: continue
+
+        real_feats = {}
+        for ver in ['v1', 'v2', 'v3']:
+            real_feats[ver] = get_dino_features_batch(real_paths, models[f'dino_{ver}'], models['dino_transform'], device)
+        if any(v is None for v in real_feats.values()): continue
+
+        # 2. Get Text Features
+        txt_feats = {}
+        with torch.no_grad():
+            ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
+            txt_feats['clip'] = models['clip_model'].encode_text(ctk)
+            txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
+
+            stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+            txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
+            txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
+
+        # 3. Update KID (Real) - Update ALL KID models with real data
+        kp = random.sample(real_paths, min(len(real_paths), 20))
+        kimgs = []
+        for p in kp:
+            try: kimgs.append(models['kid_transform'](Image.open(p).convert("RGB")))
+            except: pass
+
+        if kimgs:
+            kt = torch.stack(kimgs).to(device)
+            for m in METHODS.keys():
+                try:
+                    models['kid'][m].update(kt, real=True)
+                except Exception as e:
+                    print(f"Warning: KID update failed for {m} (real): {e}")
+
+        # 4. Evaluate Each Method
+        for method_name, dir_path in METHODS.items():
+            img_path = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
+
+            if not img_path:
+                continue
+
+            # Eval
+            res = evaluate_single(img_path, real_feats, txt_feats, models, device)
+            if res:
+                results[method_name].append(res)
+                try:
+                    models['kid'][method_name].update(
+                        models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device),
+                        real=False
+                    )
+                except Exception as e:
+                    # print(f"Warning: KID update failed for {method_name} (fake): {e}")
+                    pass
+
+    # Report
+    print("\n" + "="*80)
+    print(f"  EVAL REPORT: CUB (All Methods)")
+    print("="*80)
+
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
+    print("-" * 80)
+
+    for method_name in METHODS.keys():
+        lst = results[method_name]
+        if not lst:
+            print(f"{method_name:<15} | N/A")
+            continue
+
+        # Compute KID
+        try:
+            kid_score, _ = models['kid'][method_name].compute()
+            kid_val = kid_score.item()
+        except:
+            kid_val = 0.0
+
+        clip_s = np.mean([x['clip'] for x in lst])
+        siglip_s = np.mean([x['siglip'] for x in lst])
+        d1 = np.mean([x['dinov1_base'] for x in lst])
+        d2 = np.mean([x['dinov2_base'] for x in lst])
+        d3 = np.mean([x['dinov3_base'] for x in lst])
+
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f}")
+
+    print("="*80)
+
+if __name__ == "__main__":
+    main()

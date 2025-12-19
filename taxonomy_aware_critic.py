@@ -95,34 +95,55 @@ def message_gpt(msg, client, image_paths=[], model="gpt-4o", context_msgs=[], im
                 print("Max retries reached. Returning empty string.")
                 return ""
 
-def retrieve_knowledge(prompt, client, model="gpt-4o"):
-    """
-    Knowledge Retrieval Agent ($A_{know}$)
-    Retrieves key visual identification features for the subject in the prompt.
-    Acts as a 'Sanity Check' or 'Hard Constraint' generator.
-    """
-    msg = f"""
-    You are an expert Aircraft Encyclopedia.
+def generate_knowledge_specs(prompt, client, model="gpt-4o", domain="aircraft"):
 
-    **Task:** Retrieve the key visual identification features for the aircraft mentioned in the prompt: "{prompt}".
+    domain = domain.lower()
 
-    **Output Format:** A concise list of "Hard Constraints" that MUST be present.
-    Focus on:
+    if domain == "aircraft":
+        persona = "an expert Aircraft Encyclopedia"
+        focus_instructions = """
     1. Engine count and placement (e.g., 4 engines under wings).
     2. Wing configuration (e.g., Low-wing, swept-back).
     3. Tail configuration (e.g., T-tail, Conventional).
-    4. Distinctive features (e.g., Hump, Winglets).
+    4. Distinctive features (e.g., Hump, Winglets)."""
+
+    elif domain in ["birds", "cub", "cub_200_2011"]:
+        persona = "an expert Ornithologist"
+        focus_instructions = """
+    1. Beak shape, length, and color.
+    2. Plumage patterns (e.g., stripes, spots) and specific colors on head, wings, breast, and tail.
+    3. Distinctive markings (e.g., eye rings, crests, wing bars).
+    4. Leg color and tail shape."""
+
+    else:
+        persona = "an expert Visual Encyclopedia"
+        focus_instructions = """
+    1. Key structural components and overall shape.
+    2. Distinctive colors, patterns, textures, or materials.
+    3. Identifying markers, logos, or unique features.
+    4. Relative size and proportions."""
+
+    msg = f"""
+    You are {persona}.
+
+    **Task:** Retrieve the key visual identification features for the subject mentioned in the prompt: "{prompt}".
+
+    **Output Format:** A concise list of "Hard Constraints" that MUST be present.
+    Focus on:
+    {focus_instructions}
 
     Output as a plain text list. Do not include conversational filler.
     """
 
     return message_gpt(msg, client, [], model=model)
 
-def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_specs=None):
+def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_specs=None, domain="aircraft"):
     """
     - 身份（Taxonomy）决定基准分 (0-6)
     - 细节（Details）决定上限分 (6-10)
     """
+
+    domain = domain.lower()
 
     # Inject Reference Specs if available
     specs_context = ""
@@ -135,8 +156,33 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_s
     *Instruction:* Use these specs as the Ground Truth. If the image violates these (e.g., wrong engine count), it is a Taxonomy Error (Tier B or C).
     """
 
+    if domain == "aircraft":
+        persona = "an expert Aircraft Identification and Image Quality Assessor"
+        tier_c_desc = "Wrong Concept. (e.g., It's a bird, a truck, or a blurry mess)."
+        tier_b_desc = "Wrong Subtype/Variant. (e.g., Prompt asks for \"707-320\" [4 engines], but image shows a 2-engine plane like \"737\")."
+        tier_a_desc = "Correct Taxonomy. The image clearly shows the correct aircraft type (e.g., correct engine count, fuselage shape, wing configuration)."
+        bonus_structure = "Accurate landing gear, tail fin shape, winglets."
+        bonus_attributes = "Correct livery/paint scheme, metallic texture, reflections."
+        bonus_env = "Realistic background (runway, sky) that matches the lighting."
+    elif domain in ["birds", "cub", "cub_200_2011"]:
+        persona = "an expert Ornithologist and Bird Image Quality Assessor"
+        tier_c_desc = "Wrong Concept. (e.g., It's an airplane, a cat, or a blurry mess)."
+        tier_b_desc = "Wrong Species/Subspecies. (e.g., Prompt asks for \"Red-winged Blackbird\", but image shows a generic blackbird without red patches)."
+        tier_a_desc = "Correct Taxonomy. The image clearly shows the correct bird species (e.g., correct beak shape, plumage patterns, distinctive markings)."
+        bonus_structure = "Accurate beak shape, eye rings, leg color."
+        bonus_attributes = "Correct feather texture, vibrant colors, realistic plumage."
+        bonus_env = "Realistic natural habitat (tree branch, water, forest) that matches the lighting."
+    else:
+        persona = "an expert Image Quality Assessor"
+        tier_c_desc = "Wrong Concept. (e.g., The image does not depict the subject in the prompt)."
+        tier_b_desc = "Wrong Variant/Type. (e.g., The subject looks similar but misses key specific features requested)."
+        tier_a_desc = "Correct Taxonomy. The image clearly shows the correct subject with all key identifying features."
+        bonus_structure = "Accurate structural details and proportions."
+        bonus_attributes = "Correct colors, textures, and materials."
+        bonus_env = "Realistic and appropriate background/environment."
+
     msg = f"""
-    You are an expert Aircraft Identification and Image Quality Assessor.
+    You are {persona}.
 
     **Task:** Analyze the generated image against the prompt: "{prompt}".
     {specs_context}
@@ -144,18 +190,18 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_s
     You MUST follow this strict **Tiered Scoring Protocol** to assign the `final_score`:
 
     ### 1. Taxonomy Check (The Gatekeeper) - Max 6.0 Points
-    First, identify the object in the image. Does it match the specific aircraft model in the prompt?
-    - **Tier C (Score 0-3):** Wrong Concept. (e.g., It's a bird, a truck, or a blurry mess).
-    - **Tier B (Score 4-5):** Wrong Subtype/Variant. (e.g., Prompt asks for "707-320" [4 engines], but image shows a 2-engine plane like "737").
-    - **Tier A (Score 6.0):** Correct Taxonomy. The image clearly shows the correct aircraft type (e.g., correct engine count, fuselage shape, wing configuration).
+    First, identify the object in the image. Does it match the specific subject in the prompt?
+    - **Tier C (Score 0-3):** {tier_c_desc}
+    - **Tier B (Score 4-5):** {tier_b_desc}
+    - **Tier A (Score 6.0):** {tier_a_desc}
     *CRITICAL: If the taxonomy is wrong, the score CANNOT exceed 5.9, no matter how beautiful the image is.*
 
     ### 2. Detail & Aesthetic Bonus - Max +4.0 Points
     ONLY if the image reached Tier A (Score >= 6.0), add bonus points for details:
-    - **+1.0 Structure:** Accurate landing gear, tail fin shape, winglets.
-    - **+1.0 Attributes:** Correct livery/paint scheme, metallic texture, reflections.
-    - **+1.0 Environment:** Realistic background (runway, sky) that matches the lighting.
-    - **+1.0 Quality:** Sharp focus, 8k resolution, cinematic composition.
+    - **+1.0 Structure:** {bonus_structure}
+    - **+1.0 Attributes:** {bonus_attributes}
+    - **+1.0 Environment:** {bonus_env}
+    - **+1.0 Quality:** Sharp focus, high resolution, cinematic composition.
 
     ### 3. Remediation Strategy
     - **refined_prompt:** A full, descriptive prompt to generate a better version (Subject + Details + Aesthetics).

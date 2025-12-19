@@ -260,9 +260,9 @@ if __name__ == "__main__":
 
         # [Knowledge Retrieval] - Sanity Check
         # Retrieve specs once per class to guide the critic
-        from taxonomy_aware_critic import retrieve_knowledge
+        from taxonomy_aware_critic import generate_knowledge_specs
         try:
-            reference_specs = retrieve_knowledge(class_name, client, args.llm_model)
+            reference_specs = generate_knowledge_specs(class_name, client, args.llm_model)
             f_log.write(f"Reference Specs: {reference_specs}\n")
         except Exception as e:
             f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
@@ -295,8 +295,8 @@ if __name__ == "__main__":
                 best_score = score
                 best_image_path = current_image
 
-            if score >= 8.0:
-                f_log.write(f">> Success! (Score: {score})\n")
+            if score >= 8.0 or (score >= 6.0 and taxonomy_status == 'correct'):
+                f_log.write(f">> Success! (Score: {score}, Taxonomy: {taxonomy_status})\n")
                 shutil.copy(current_image, final_success_path)
                 break
 
@@ -405,5 +405,5 @@ if __name__ == "__main__":
 
     end_time = time.time()
     elapsed_time = end_time - start_time
-    with open(os.path.join(DATASET_CONFIG['output_path'], "time_elapsed.txt"), "w") as f:
+    with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")

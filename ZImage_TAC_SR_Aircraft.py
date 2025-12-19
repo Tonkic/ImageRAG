@@ -275,5 +275,5 @@ if __name__ == "__main__":
 
     end_time = time.time()
     elapsed_time = end_time - start_time
-    with open(os.path.join(DATASET_CONFIG['output_path'], "time_elapsed.txt"), "w") as f:
+    with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")

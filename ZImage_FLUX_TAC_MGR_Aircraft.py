@@ -250,9 +250,9 @@ if __name__ == "__main__":
             # --- Stage 3: Quality Evaluator (A_eval) ---
             # [Knowledge Retrieval] - Sanity Check (Lazy Load if not present)
             if 'reference_specs' not in locals():
-                from taxonomy_aware_critic import retrieve_knowledge
+                from taxonomy_aware_critic import generate_knowledge_specs
                 try:
-                    reference_specs = retrieve_knowledge(class_name, client, args.llm_model)
+                    reference_specs = generate_knowledge_specs(class_name, client, args.llm_model)
                     f_log.write(f"Reference Specs: {reference_specs}\\n")
                 except Exception as e:
                     f_log.write(f"Reference Specs Retrieval Failed: {e}\\n")
@@ -261,20 +261,21 @@ if __name__ == "__main__":
             diagnosis = taxonomy_aware_diagnosis(current_prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
 
             score = diagnosis.get('final_score', 0)
+            taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
             critique = diagnosis.get('critique', '')
             refined_prompt = diagnosis.get('refined_prompt', current_prompt)
             error_analysis = diagnosis.get('error_analysis', {})
             error_type = error_analysis.get('type', 'Global')
             bbox = error_analysis.get('bbox', None)
 
-            f_log.write(f"Score: {score} | Error Type: {error_type}\\nCritique: {critique}\\n")
+            f_log.write(f"Score: {score} | Taxonomy: {taxonomy_status} | Error Type: {error_type}\nCritique: {critique}\n")
 
             if score > best_score:
                 best_score = score
                 best_image_path = current_image
 
-            if score >= 8.0:
-                f_log.write(">> Success! Score >= 8.0\\n")
+            if score >= 8.0 or (score >= 6.0 and taxonomy_status == 'correct'):
+                f_log.write(f">> Success! (Score: {score}, Taxonomy: {taxonomy_status})\n")
                 shutil.copy(current_image, final_success_path)
                 break
 

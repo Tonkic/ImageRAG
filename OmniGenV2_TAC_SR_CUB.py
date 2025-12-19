@@ -1,14 +1,14 @@
 '''
-OmniGenV2_TAC_SR_Aircraft.py
+OmniGenV2_TAC_SR_CUB.py
 =============================
 Configuration:
   - Generator: OmniGen V2
   - Critic: Taxonomy-Aware Critic (TAC) -> Fine-grained diagnosis
   - Retrieval: Static Retrieval (SR) -> No memory/exclusion list
-  - Dataset: FGVC-Aircraft
+  - Dataset: CUB-200-2011 (Birds)
 
 Usage:
-  python OmniGenV2_TAC_SR_Aircraft.py \
+  python OmniGenV2_TAC_SR_CUB.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
@@ -27,7 +27,7 @@ os.environ.pop("https_proxy", None)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + SR (Aircraft)")
+parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + SR (CUB)")
 
 # Core Config
 parser.add_argument("--device_id", type=int, required=True)
@@ -39,14 +39,14 @@ parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
 parser.add_argument("--transformer_lora_path", type=str, default=None)
 parser.add_argument("--openai_api_key", type=str, required=True)
-parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # SiliconFlow Default
+parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Params
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
-parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher guidance for composition
-parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--image_guidance_scale", type=float, default=1.5)
+parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/cub")
 parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
 
 args = parser.parse_args()
@@ -80,10 +80,10 @@ def seed_everything(seed):
 
 # --- 2. Config ---
 DATASET_CONFIG = {
-    "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
-    "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
-    "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_SR_Aircraft"
+    "classes_txt": "datasets/CUB_200_2011/classes.txt",
+    "train_list": "datasets/CUB_200_2011/train_test_split.txt",
+    "image_root": "datasets/CUB_200_2011/images",
+    "output_path": "results/OmniGenV2_TAC_SR_CUB"
 }
 
 # --- 3. Setup ---
@@ -95,9 +95,8 @@ def setup_system():
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True, # Required for custom code
+            trust_remote_code=True,
         )
-        # Patch for missing attribute
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
         pipe.vae.enable_tiling()
@@ -105,13 +104,7 @@ def setup_system():
         pipe.to("cuda")
     except ImportError as e:
         print(f"Error: OmniGen2 not found. Details: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
-
-    # os.environ.pop("http_proxy", None)
-    # os.environ.pop("https_proxy", None)
-    # os.environ.pop("all_proxy", None)
 
     print("Initializing OpenAI Client for SiliconFlow...")
     client = openai.OpenAI(
@@ -121,15 +114,30 @@ def setup_system():
     return pipe, client
 
 def load_db():
-    print("Loading DB...")
-    paths = []
+    print("Loading CUB DB...")
+    # 1. Load Train Split
+    train_ids = set()
     with open(DATASET_CONFIG['train_list'], 'r') as f:
-        for line in f.readlines():
-            line = line.strip()
-            if not line: continue
-            img_path = os.path.join(DATASET_CONFIG['image_root'], f"{line}.jpg")
-            if os.path.exists(img_path):
-                paths.append(img_path)
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == '1':
+                train_ids.add(parts[0])
+
+    # 2. Load Image Paths
+    paths = []
+    images_txt = os.path.join(os.path.dirname(DATASET_CONFIG['image_root']), "images.txt")
+
+    with open(images_txt, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                img_id = parts[0]
+                rel_path = parts[1]
+                if img_id in train_ids:
+                    full_path = os.path.join(DATASET_CONFIG['image_root'], rel_path)
+                    if os.path.exists(full_path):
+                        paths.append(full_path)
+    print(f"Loaded {len(paths)} training images.")
     return paths
 
 def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scale=None, text_guidance_scale=None):
@@ -166,11 +174,10 @@ if __name__ == "__main__":
 
     seed_everything(args.seed)
 
-    # 1. Load DB & Pre-calculate Embeddings (Warmup)
+    # 1. Load DB & Pre-calculate Embeddings
     retrieval_db = load_db()
     print("Pre-calculating/Loading retrieval embeddings on GPU...")
     try:
-        # Run a dummy retrieval on the FULL database to force caching
         retrieve_img_per_caption(
             ["warmup_query"],
             retrieval_db,
@@ -185,7 +192,6 @@ if __name__ == "__main__":
         print(f"Warning during embedding caching: {e}")
 
     pipe, client = setup_system()
-    # retrieval_db = load_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     # Create logs directory
@@ -201,16 +207,24 @@ if __name__ == "__main__":
             f.write(f"{arg}: {getattr(args, arg)}\n")
         f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
 
-
+    # Load Classes
     with open(DATASET_CONFIG['classes_txt']) as f:
-        all_classes = [l.strip() for l in f.readlines() if l.strip()]
+        all_classes = []
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                raw_name = parts[1]
+                if '.' in raw_name:
+                    raw_name = raw_name.split('.', 1)[1]
+                all_classes.append(raw_name)
 
     my_tasks = [c for i, c in enumerate(all_classes) if i % args.total_chunks == args.task_index]
     print(f"Processing {len(my_tasks)} classes.")
 
-    for class_name in tqdm(my_tasks):
-        safe_name = class_name.replace(" ", "_").replace("/", "-")
-        prompt = f"a photo of a {class_name}"
+    for class_name_raw in tqdm(my_tasks):
+        class_name = class_name_raw.replace("_", " ")
+        safe_name = class_name_raw
+        prompt = f"a photo of a {class_name}, a type of bird"
 
         log_file = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}.log")
         f_log = open(log_file, "w")
@@ -220,16 +234,14 @@ if __name__ == "__main__":
         v1_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V1.png")
 
         # [Optimization] Shared Baseline Logic
-        baseline_dir = "results/OmniGenV2_Baseline_Aircraft"
+        baseline_dir = "results/OmniGenV2_Baseline_CUB"
         baseline_v1_path = os.path.join(baseline_dir, f"{safe_name}_V1.png")
 
         if not os.path.exists(v1_path):
             if os.path.exists(baseline_v1_path):
-                # print(f"Copying V1 from baseline: {baseline_v1_path}")
                 shutil.copy(baseline_v1_path, v1_path)
             else:
                 run_omnigen(pipe, prompt, [], v1_path, args.seed)
-                # Try to populate baseline
                 try:
                     os.makedirs(baseline_dir, exist_ok=True)
                     shutil.copy(v1_path, baseline_v1_path)
@@ -245,18 +257,18 @@ if __name__ == "__main__":
         # [Knowledge Retrieval] - Sanity Check
         from taxonomy_aware_critic import generate_knowledge_specs
         try:
-            reference_specs = generate_knowledge_specs(class_name, client, args.llm_model)
+            reference_specs = generate_knowledge_specs(class_name, client, args.llm_model, domain="cub")
             f_log.write(f"Reference Specs: {reference_specs}\n")
         except Exception as e:
             f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
             reference_specs = None
 
-        # Loop (Static Retrieval = No Exclusion List)
+        # Loop
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
             # A. TAC Diagnosis (V4.0)
-            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
+            diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, reference_specs=reference_specs, domain="cub")
 
             score = diagnosis.get('final_score', 0)
             taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
@@ -308,12 +320,10 @@ if __name__ == "__main__":
             # C. Generation Strategy
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
-            # [Modified] Unified Guidance Scale (Same as BC)
-            current_img_guidance = 1.5 # Fixed value as requested
+            current_img_guidance = 1.5
             current_text_guidance = args.text_guidance_scale
             f_log.write(f">> Strategy: Unified Guidance (Image: {current_img_guidance}, Text: {current_text_guidance})\n")
 
-            # User Request: Use original_prompt + visual_keywords (refined_prompt)
             if refined_prompt != prompt:
                 gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
             else:
@@ -329,7 +339,7 @@ if __name__ == "__main__":
         if not os.path.exists(final_success_path):
             f_log.write(f"\n--- Final Check (Last Generated) ---\n")
             if os.path.exists(current_image):
-                diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
+                diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, domain="cub")
                 score = diagnosis.get('score', 0)
                 f_log.write(f"Final Image Score: {score}\n")
                 if score > best_score:
