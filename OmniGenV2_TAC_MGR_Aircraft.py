@@ -26,6 +26,7 @@ parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + MGR (Aircraft)")
 
 # Core Config
 parser.add_argument("--device_id", type=int, required=True, help="GPU Device ID")
+parser.add_argument("--retrieval_device_id", type=int, default=None, help="Retrieval GPU Device ID")
 parser.add_argument("--task_index", type=int, default=0)
 parser.add_argument("--total_chunks", type=int, default=1)
 
@@ -42,12 +43,22 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher for TAC logic
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Hybrid", "colqwen3"], help="Retrieval Model")
 
 args = parser.parse_args()
 
 # Environment
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+if args.retrieval_device_id is not None and args.retrieval_device_id != args.device_id:
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.device_id},{args.retrieval_device_id}"
+    omnigen_device = "cuda:0"
+    retrieval_device = "cuda:1"
+    print(f"DEBUG: Using Multi-GPU. OmniGen on GPU {args.device_id} (internal cuda:0), Retrieval on GPU {args.retrieval_device_id} (internal cuda:1)")
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+    omnigen_device = "cuda:0"
+    retrieval_device = "cuda:0"
+    print(f"DEBUG: Using Single-GPU on device {args.device_id}")
+
 print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
 
 import json
@@ -181,7 +192,7 @@ if __name__ == "__main__":
             retrieval_db,
             embeddings_path=args.embeddings_path,
             k=1,
-            device="cuda",
+            device=retrieval_device,
             method=args.retrieval_method
         )
         # Clear GPU cache after retrieval model is done
@@ -302,9 +313,17 @@ if __name__ == "__main__":
 
             # B. Memory-Guided Retrieval
             # Use the specific queries from TAC
-            # Force Class Name injection
-            query_text = f"{class_name} {class_name}. " + " ".join(mgr_queries)
-            if len(query_text) > 300: query_text = query_text[:300]
+
+            if args.retrieval_method in ["CLIP", "SigLIP", "SigLIP2"]:
+                 # Use concise prompt from LLM to avoid token overflow
+                 query_text = diagnosis.get('concise_retrieval_prompt', f"{class_name} {class_name}")
+                 # Fallback if LLM didn't return it
+                 if not query_text or len(query_text) < 5:
+                     query_text = f"{class_name} {class_name}"
+            else:
+                 # Force Class Name injection for long-context models
+                 query_text = f"{class_name} {class_name}. " + " ".join(mgr_queries)
+                 if len(query_text) > 300: query_text = query_text[:300]
 
             # [Token Length Check]
             from memory_guided_retrieval import check_token_length
@@ -314,7 +333,7 @@ if __name__ == "__main__":
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query_text], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=50, device="cuda", method=args.retrieval_method,
+                    k=50, device=retrieval_device, method=args.retrieval_method,
                     global_memory=global_memory
                 )
                 candidates = retrieved_lists[0]
@@ -355,19 +374,13 @@ if __name__ == "__main__":
 
             # Always use refined prompt + reference
             # User Request: Use original_prompt + visual_keywords (refined_prompt)
-            if refined_prompt != prompt:
-                gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
-            else:
-                gen_prompt = f"{prompt}. Use reference image <|image_1|>."
+            gen_prompt = f"{refined_prompt}. Use reference image <|image_1|>."
 
             run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
 
             current_image = next_path
             # Update prompt for next round (Keep the full context)
-            if refined_prompt != prompt:
-                current_prompt = f"{prompt}. {refined_prompt}"
-            else:
-                current_prompt = prompt
+            current_prompt = refined_prompt
             retry_cnt += 1
 
         # Final Check for the last generated image if loop finished without success

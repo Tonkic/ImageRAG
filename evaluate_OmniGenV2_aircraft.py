@@ -47,6 +47,12 @@ import open_clip
 from open_clip import create_model_from_pretrained, get_tokenizer
 from torchmetrics.image.kid import KernelInceptionDistance
 
+# [New] Imports for ColQwen3
+try:
+    from transformers import AutoModel, AutoProcessor, AutoConfig
+except ImportError:
+    print("Transformers not found.")
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
@@ -152,6 +158,19 @@ def load_models(device):
 
     models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
 
+    # 7. ColQwen3
+    print("Loading ColQwen3...")
+    try:
+        # Load model directly
+        models['colqwen3_model'] = AutoModel.from_pretrained(
+            "TomoroAI/tomoro-colqwen3-embed-8b",
+            trust_remote_code=True,
+            dtype="auto"
+        ).to(device).eval()
+        models['colqwen3_processor'] = AutoProcessor.from_pretrained("TomoroAI/tomoro-colqwen3-embed-8b", trust_remote_code=True)
+    except Exception as e:
+        print(f"Error loading ColQwen3: {e}")
+
     return models
 
 # --------------------------------------------------
@@ -236,7 +255,7 @@ def get_dino_features_batch(paths, model, transform, device, batch_size=32):
     if not feats: return None
     return F.normalize(torch.cat(feats, dim=0), dim=-1)
 
-def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
+def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=None):
     scores = {}
     try:
         img = Image.open(img_path).convert("RGB")
@@ -259,6 +278,44 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device):
             s_feat = models['siglip_model'].encode_image(s_in)
             s_feat = F.normalize(s_feat, dim=-1)
             scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
+
+            # ColQwen3 MaxSim
+            if 'colqwen3' in txt_feats and 'colqwen3_model' in models:
+                processor = models['colqwen3_processor']
+                model = models['colqwen3_model']
+
+                # Process Image
+                if hasattr(processor, "process_images"):
+                    batch_images = processor.process_images([img]).to(device)
+                    image_out = model(**batch_images)
+                    if hasattr(image_out, 'embeddings'):
+                        image_emb = image_out.embeddings
+                    elif hasattr(image_out, 'last_hidden_state'):
+                        image_emb = image_out.last_hidden_state
+                    else:
+                        image_emb = image_out
+                else:
+                    inputs = processor(images=img, return_tensors="pt").to(device)
+                    image_out = model(**inputs)
+                    if hasattr(image_out, 'embeddings'):
+                        image_emb = image_out.embeddings
+                    elif hasattr(image_out, 'last_hidden_state'):
+                        image_emb = image_out.last_hidden_state
+                    else:
+                        image_emb = image_out
+
+                # MaxSim
+                Q = txt_feats['colqwen3'].to(device)
+                D = image_emb.to(device)
+
+                # Ensure dtype match
+                D = D.to(Q.dtype)
+
+                sim_matrix = torch.einsum('bqd,bnd->bqn', Q, D)
+                max_sim = sim_matrix.max(dim=-1).values
+                score = max_sim.sum(dim=-1).item()
+                scores['colqwen3_maxsim'] = score
+
     except Exception as e:
         # print(f"Error evaluating {img_path}: {e}")
         return None
@@ -315,9 +372,64 @@ def main():
             txt_feats['clip'] = models['clip_model'].encode_text(ctk)
             txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
 
-            stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+            # SigLIP Tokenizer Fix
+            # open_clip's get_tokenizer returns a wrapper that calls batch_encode_plus
+            # But for HF models (like SigLIP), it might wrap a T5Tokenizer which doesn't have it in older versions?
+            # Or open_clip wrapper expects the underlying tokenizer to have it.
+            # Fix: Use the tokenizer directly if it's callable, or handle the specific HF tokenizer case.
+
+            # Actually, open_clip.get_tokenizer returns a function/callable usually.
+            # But for HF models, it returns a HFTokenizer wrapper.
+            # The error says T5Tokenizer has no attribute batch_encode_plus.
+            # This suggests we should use the tokenizer as a callable or use encode_plus in a loop if batch_encode_plus is missing.
+
+            # Simpler fix: Just use the tokenizer as a callable if it works, or try-except block.
+            # However, open_clip's HFTokenizer wrapper calls self.tokenizer.batch_encode_plus.
+            # If the underlying T5Tokenizer doesn't have it, we need to patch or use a different way.
+
+            # Let's try to use the tokenizer directly if it fails.
+            try:
+                stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+            except AttributeError:
+                # Fallback for T5Tokenizer issues in some transformers versions
+                # We can manually tokenize if needed, but let's try to access the internal tokenizer
+                if hasattr(models['siglip_tokenizer'], 'tokenizer'):
+                    # It's the HFTokenizer wrapper
+                    internal_tok = models['siglip_tokenizer'].tokenizer
+                    if hasattr(internal_tok, '__call__'):
+                        res = internal_tok(
+                            [task["prompt"]],
+                            padding='max_length',
+                            truncation=True,
+                            max_length=64,
+                            return_tensors='pt'
+                        )
+                        stk = res['input_ids'].to(device)
+                    else:
+                        raise
+                else:
+                    raise
+
             txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
             txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
+
+            # ColQwen3
+            if 'colqwen3_model' in models:
+                try:
+                    processor = models['colqwen3_processor']
+                    model = models['colqwen3_model']
+                    with torch.no_grad():
+                        if hasattr(processor, "process_texts"):
+                            batch_queries = processor.process_texts([task["prompt"]])
+                            batch_queries = {k: v.to(device) for k, v in batch_queries.items()}
+                            query_outputs = model(**batch_queries)
+                            txt_feats['colqwen3'] = query_outputs.embeddings if hasattr(query_outputs, 'embeddings') else query_outputs
+                        else:
+                            inputs = processor(text=[task["prompt"]], return_tensors="pt", padding=True).to(device)
+                            out = model(**inputs)
+                            txt_feats['colqwen3'] = out.embeddings if hasattr(out, 'embeddings') else out.last_hidden_state
+                except Exception as e:
+                    print(f"Error encoding text for ColQwen3: {e}")
 
         # 3. Update KID (Real) - Update ALL KID models with real data
         kp = random.sample(real_paths, min(len(real_paths), 20))
@@ -342,7 +454,7 @@ def main():
                 continue
 
             # Eval
-            res = evaluate_single(img_path, real_feats, txt_feats, models, device)
+            res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
             if res:
                 results[method_name].append(res)
                 try:
@@ -359,7 +471,7 @@ def main():
     print(f"  EVAL REPORT: Aircraft (All Methods)")
     print("="*80)
 
-    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8}")
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8} | {'MaxSim':<8}")
     print("-" * 80)
 
     for method_name in METHODS.keys():
@@ -380,8 +492,9 @@ def main():
         d1 = np.mean([x['dinov1_base'] for x in lst])
         d2 = np.mean([x['dinov2_base'] for x in lst])
         d3 = np.mean([x['dinov3_base'] for x in lst])
+        cq3 = np.mean([x.get('colqwen3_maxsim', 0) for x in lst])
 
-        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f}")
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f} | {cq3:.4f}")
 
     print("="*80)
 

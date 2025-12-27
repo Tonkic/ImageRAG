@@ -205,6 +205,7 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_s
 
     ### 3. Remediation Strategy
     - **refined_prompt:** A full, descriptive prompt to generate a better version (Subject + Details + Aesthetics).
+    - **concise_retrieval_prompt:** A short, keyword-focused prompt (max 30 words) summarizing the subject and key missing features. Optimized for CLIP/SigLIP (max 64 tokens).
     - **retrieval_queries:** Short keywords to find reference images for the MISSING or WRONG parts.
     - **error_analysis:**
         - "type": "Global" (Structural/Taxonomy error) OR "Local" (Detail/Text/Attribute error).
@@ -216,6 +217,7 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_s
         "taxonomy_check": "correct" | "wrong_subtype" | "wrong_object",
         "critique": "Brief explanation.",
         "refined_prompt": "...",
+        "concise_retrieval_prompt": "...",
         "retrieval_queries": ["..."],
         "error_analysis": {{
             "type": "Global" | "Local"
