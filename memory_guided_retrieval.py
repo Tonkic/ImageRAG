@@ -18,13 +18,7 @@ except ImportError:
     print("Warning: Long-CLIP not found.")
 
 # [Optional] ColPali Imports
-try:
-    from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-    from transformers.utils.import_utils import is_flash_attn_2_available
-    COLPALI_AVAILABLE = True
-except ImportError:
-    COLPALI_AVAILABLE = False
-    print("Warning: ColPali engine not found. method='ColPali' will fail.")
+# Removed ColPali imports as requested
 
 # -----------------------------------------------------------------------------
 # Memory-Guided Retrieval Module
@@ -33,30 +27,6 @@ except ImportError:
 def check_token_length(prompts, device="cpu", method="CLIP"):
     # [Modified] Disable warning as we now handle long text via chunking
     return
-
-def get_colpali_similarities(prompts, image_paths, embeddings_path="", bs=4, k=50, device='cuda:0', save=False):
-    """
-    ColPali (ColQwen2.5) Retrieval
-    """
-    if not COLPALI_AVAILABLE:
-        print("ColPali not available.")
-        return [], []
-
-    model_name = "vidore/colqwen2.5-v0.2"
-    try:
-        processor = ColQwen2_5_Processor.from_pretrained(model_name)
-        model = ColQwen2_5.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
-        ).eval()
-    except Exception as e:
-        print(f"Error loading ColPali: {e}")
-        return [], []
-
-    if isinstance(prompts, str):
-        prompts = [prompts]
 
     # Process Queries
     with torch.no_grad():
@@ -87,66 +57,6 @@ def get_colpali_similarities(prompts, image_paths, embeddings_path="", bs=4, k=5
                     except: continue
 
                 if not images: continue
-
-                # Process Images
-                batch_images = processor.process_images(images).to(device)
-                # [Batch, N_d, Dim]
-                batch_doc_embeddings = model(**batch_images)
-
-                # Save as list to handle variable sequence lengths if any (though ColQwen usually fixed patches)
-                # But let's save the tensor batch if possible, or list
-                # ColQwen output is a list of tensors if input is list? No, model(**batch) returns tensor usually?
-                # Actually ColQwen2.5 model forward returns embeddings.
-
-                final_bi_paths = valid_paths
-
-                if embeddings_path:
-                    os.makedirs(embeddings_path, exist_ok=True)
-                    torch.save({
-                        "colpali_embeddings": batch_doc_embeddings,
-                        "paths": final_bi_paths
-                    }, cache_file)
-            else:
-                continue
-
-            # Compute MaxSim (Late Interaction)
-            # Q: [1, N_q, D], D: [B, N_d, D]
-            # Score = sum_over_q(max_over_d(Q @ D.T))
-
-            # Ensure dtype match
-            batch_doc_embeddings = batch_doc_embeddings.to(query_embeddings.dtype)
-
-            # Loop over queries
-            for i in range(len(prompts)):
-                Q = query_embeddings[i] # [N_q, D]
-                # Batch of docs: [B, N_d, D]
-                D = batch_doc_embeddings
-
-                # Q: [N_q, D] -> [1, N_q, D]
-                # D: [B, N_d, D] -> [B, D, N_d] (transpose last two)
-
-                # Sim: [B, N_q, N_d]
-                sim_matrix = torch.einsum('qd,bnd->bqn', Q, D)
-
-                # Max over doc tokens: [B, N_q]
-                max_sim_scores = sim_matrix.max(dim=-1).values
-
-                # Sum over query tokens: [B]
-                scores = max_sim_scores.sum(dim=-1)
-
-                all_scores.append(scores.cpu().numpy()) # This appends [B] array
-
-            all_paths.extend(final_bi_paths)
-
-    # Re-organize scores
-    # all_scores is a list of arrays, one per batch? No, I looped over queries inside batch loop.
-    # Wait, the structure above is wrong.
-    # I should accumulate scores for each query across all batches.
-
-    # Let's restructure:
-    # Initialize scores for each query
-    final_scores_map = {i: [] for i in range(len(prompts))}
-    final_paths = [] # Assuming all batches processed sequentially
 
     # ... (Re-implementing loop logic correctly in the tool call)
 
@@ -253,89 +163,7 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
     # Let's simplify: return empty for now if not implemented fully, but I will implement fully below.
     pass
 
-def get_colpali_similarities_full(prompts, image_paths, embeddings_path="", bs=4, k=50, device='cuda:0', save=False):
-    if not COLPALI_AVAILABLE: return [], []
-
-    model_name = "vidore/colqwen2.5-v0.2"
-    try:
-        processor = ColQwen2_5_Processor.from_pretrained(model_name)
-        model = ColQwen2_5.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
-        ).eval()
-    except: return [], []
-
-    if isinstance(prompts, str): prompts = [prompts]
-
-    with torch.no_grad():
-        batch_queries = processor.process_queries(prompts).to(device)
-        query_embeddings = model(**batch_queries) # [N_q_batch, Seq_q, Dim]
-
-    all_scores_per_query = [[] for _ in range(len(prompts))]
-    all_paths = []
-
-    with torch.no_grad():
-        for bi in range(0, len(image_paths), bs):
-            cache_file = os.path.join(embeddings_path, f"colpali_embeddings_b{bi}.pt")
-            current_batch_paths = image_paths[bi : bi + bs]
-
-            batch_doc_embeddings = None
-            final_bi_paths = []
-
-            if os.path.exists(cache_file):
-                try:
-                    data = torch.load(cache_file, map_location=device, weights_only=False)
-                    batch_doc_embeddings = data['colpali_embeddings']
-                    final_bi_paths = data.get('paths', current_batch_paths)
-                except: pass
-
-            if batch_doc_embeddings is None and save:
-                images = []
-                valid_paths = []
-                for path in current_batch_paths:
-                    try:
-                        images.append(Image.open(path).convert("RGB"))
-                        valid_paths.append(path)
-                    except: continue
-
-                if images:
-                    batch_images = processor.process_images(images).to(device)
-                    batch_doc_embeddings = model(**batch_images) # [B, Seq_d, Dim]
-                    final_bi_paths = valid_paths
-
-                    if embeddings_path:
-                        os.makedirs(embeddings_path, exist_ok=True)
-                        torch.save({"colpali_embeddings": batch_doc_embeddings, "paths": final_bi_paths}, cache_file)
-
-            if batch_doc_embeddings is not None:
-                batch_doc_embeddings = batch_doc_embeddings.to(query_embeddings.dtype)
-                # MaxSim
-                # Q: [N_prompts, Seq_q, Dim]
-                # D: [B, Seq_d, Dim]
-                for i in range(len(prompts)):
-                    Q = query_embeddings[i] # [Seq_q, Dim]
-                    D = batch_doc_embeddings # [B, Seq_d, Dim]
-
-                    # [B, Seq_q, Seq_d]
-                    sim = torch.einsum('qd,bnd->bqn', Q, D)
-                    scores = sim.max(dim=-1).values.sum(dim=-1) # [B]
-                    all_scores_per_query[i].extend(scores.cpu().float().numpy().tolist())
-
-                all_paths.extend(final_bi_paths)
-
-    # Top K
-    if not all_scores_per_query[0]: return [], []
-
-    single_prompt_scores = np.array(all_scores_per_query[0])
-    k = min(k, len(single_prompt_scores))
-    top_indices = np.argsort(single_prompt_scores)[-k:][::-1]
-
-    top_paths = [all_paths[i] for i in top_indices]
-    top_scores = single_prompt_scores[top_indices].tolist()
-
-    return top_paths, top_scores
+# Removed get_colpali_similarities_full as requested
 
 def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0', save=False, cache_dir=None):
     """
@@ -553,101 +381,7 @@ class GlobalMemory:
         return [], []
 
 
-def get_colqwen3_similarities(prompts, image_paths, embeddings_path="", bs=4, k=50, device='cuda:0', save=False):
-    """
-    ColQwen3 Retrieval (TomoroAI/tomoro-colqwen3-embed-8b)
-    """
-    print("Loading ColQwen3...")
-    # Set HF Mirror
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-    try:
-        from transformers import AutoModel, AutoProcessor, AutoConfig
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-        model_name = "TomoroAI/tomoro-colqwen3-embed-8b"
-
-        # [Fix] Patch tie_weights
-        try:
-            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            class_ref = config.auto_map["AutoModel"]
-            model_class = get_class_from_dynamic_module(class_ref, model_name)
-            if hasattr(model_class, "tie_weights"):
-                original_tie_weights = model_class.tie_weights
-                def safe_tie_weights(self, **kwargs):
-                    kwargs.pop("missing_keys", None)
-                    return original_tie_weights(self) # Removed **kwargs as per check script
-                model_class.tie_weights = safe_tie_weights
-
-            print(f"Loading ColQwen3 with BF16 and FlashAttention2 on {device}...")
-            model = model_class.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-                device_map={"": device}
-            ).eval()
-        except Exception as patch_err:
-            print(f"Patching/Loading failed ({patch_err}), trying standard load...")
-            model = AutoModel.from_pretrained(model_name, trust_remote_code=True, dtype="auto").to(device).eval()
-
-        # [Refinement] Set max_num_visual_tokens=1280 as per official usage
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, max_num_visual_tokens=1280)
-    except Exception as e:
-        print(f"Error loading ColQwen3: {e}")
-        return [], []
-
-    if isinstance(prompts, str):
-        prompts = [prompts]
-
-    # Process Queries
-    with torch.no_grad():
-        # ColQwen3 uses process_texts
-        if hasattr(processor, "process_texts"):
-            batch_queries = processor.process_texts(prompts)
-            # Move to device
-            batch_queries = {k: v.to(device) for k, v in batch_queries.items()}
-            query_outputs = model(**batch_queries)
-            query_embeddings = query_outputs.embeddings
-        elif hasattr(processor, "process_queries"): # ColPali fallback
-            batch_queries = processor.process_queries(prompts).to(device)
-            query_embeddings = model(**batch_queries)
-        else:
-            # Fallback or standard usage if processor handles it
-            inputs = processor(text=prompts, return_tensors="pt", padding=True).to(device)
-            query_embeddings = model(**inputs)
-            if hasattr(query_embeddings, 'embeddings'): # ColPali output
-                query_embeddings = query_embeddings.embeddings
-            elif hasattr(query_embeddings, 'last_hidden_state'):
-                 query_embeddings = query_embeddings.last_hidden_state
-
-    results_per_prompt = {i: {'paths': [], 'scores': []} for i in range(len(prompts))}
-
-    with torch.no_grad():
-        for bi in range(0, len(image_paths), bs):
-            cache_file = os.path.join(embeddings_path, f"colqwen3_embeddings_b{bi}.pt")
-            current_batch_paths = image_paths[bi : bi + bs]
-
-            batch_doc_embeddings = None
-            final_bi_paths = []
-
-            if os.path.exists(cache_file):
-                try:
-                    data = torch.load(cache_file, map_location=device, weights_only=False)
-                    loaded_embeddings = data['embeddings']
-                    # [Fix] Dimension Check
-                    if loaded_embeddings.shape[-1] != query_embeddings.shape[-1]:
-                        print(f"[Batch {bi}/{len(image_paths)}] Dimension mismatch: Cache {loaded_embeddings.shape[-1]} vs Model {query_embeddings.shape[-1]}. Regenerating...")
-                        batch_doc_embeddings = None # Force regen
-                    else:
-                        batch_doc_embeddings = loaded_embeddings
-                        final_bi_paths = data.get('paths', current_batch_paths)
-                except Exception as e:
-                    print(f"Error loading cache {cache_file}: {e}. Regenerating...")
-                    batch_doc_embeddings = None
-
-            if batch_doc_embeddings is None and save:
-                images = []
-                valid_paths = []
+# Removed ColQwen3 retrieval function as requested
                 for path in current_batch_paths:
                     try:
                         img_pil = Image.open(path).convert("RGB")
@@ -1129,7 +863,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
 
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
@@ -1142,7 +876,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
 
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
@@ -1160,17 +894,6 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
-        elif method == 'ColPali':
-            paths, scores = get_colpali_similarities_full(
-                [caption], image_paths,
-                embeddings_path=embeddings_path,
-                k=k, device=device, save=True
-            )
-            if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
-            all_retrieved_paths.append(paths)
-            all_retrieved_scores.append(scores)
-
         elif method == 'LongCLIP':
             paths, scores = get_longclip_similarities(
                 [caption], image_paths,
@@ -1178,21 +901,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 k=k, device=device
             )
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
-            all_retrieved_paths.append(paths)
-            all_retrieved_scores.append(scores)
-
-        elif method == 'colqwen3':
-            paths_list, scores_list = get_colqwen3_similarities(
-                [caption], image_paths,
-                embeddings_path=embeddings_path,
-                k=k, device=device, save=True
-            )
-            paths = paths_list[0]
-            scores = scores_list[0]
-
-            if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
@@ -1211,7 +920,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 scores = []
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
@@ -1230,7 +939,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 scores = []
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
 
@@ -1243,7 +952,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
 
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)

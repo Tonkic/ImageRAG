@@ -43,7 +43,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # TAC 逻辑需要较高的图像引导
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Hybrid", "colqwen3", "BGE-VL", "Qwen2.5-VL"], help="检索模型")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "Hybrid", "BGE-VL", "Qwen2.5-VL"], help="检索模型")
 parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter (for Qwen2.5-VL)")
 
 args = parser.parse_args()
@@ -266,7 +266,11 @@ if __name__ == "__main__":
         retry_cnt = 0
 
         # [MGR 核心]: 用于重排序的全局记忆
-        global_memory = GlobalMemory()
+        global_memory = GlobalMemory(
+            device=retrieval_device,
+            embedding_model=args.retrieval_method,
+            adapter_path=args.adapter_path
+        )
         last_used_ref = None
 
         # [分数追踪]
@@ -416,7 +420,11 @@ if __name__ == "__main__":
     print("所有类别处理完毕。开始全局记忆训练...")
     try:
         # 重新初始化以确保状态干净，并加载所有累积的记忆
-        trainer_memory = GlobalMemory()
+        trainer_memory = GlobalMemory(
+            device=retrieval_device,
+            embedding_model=args.retrieval_method,
+            adapter_path=args.adapter_path
+        )
         trainer_memory.memory = all_feedback_memory # 注入收集到的记忆
         trainer_memory.train_model(epochs=20, plot_path=os.path.join(DATASET_CONFIG['output_path'], "logs", "memory_loss.png"))
     except Exception as e:
