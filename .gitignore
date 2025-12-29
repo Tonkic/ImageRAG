@@ -15,6 +15,9 @@ Z-Image-Turbo/
 Long-CLIP/
 sam2/
 tomoro-colqwen3-embed-8b/
+FlagEmbedding/
+models/
+output/
 
 # 大型数据集和文件
 datasets/

@@ -718,7 +718,349 @@ def get_colqwen3_similarities(prompts, image_paths, embeddings_path="", bs=4, k=
 
     return final_paths_list, final_scores_list
 
-def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None):
+def get_bge_vl_similarities(prompts, image_paths, embeddings_path="", bs=32, k=50, device='cuda:0', save=False):
+    """
+    BGE-VL Retrieval Logic
+    """
+    try:
+        from transformers import AutoModel
+        MODEL_NAME = "BAAI/BGE-VL-large"
+
+        # [Fix] Load on CPU first to debug/prevent CUDA context corruption
+        print(f"Loading {MODEL_NAME} on CPU first...")
+        model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+        # [Fix] Re-initialize position_ids if they are invalid (garbage values)
+        # This is a known issue with some remote code models where buffers are not initialized correctly
+
+        # 1. Fix Text Model Position IDs
+        if hasattr(model, "text_model") and hasattr(model.text_model, "embeddings") and hasattr(model.text_model.embeddings, "position_ids"):
+            pos_ids = model.text_model.embeddings.position_ids
+            # Check if max value is garbage (>= 77 for CLIP)
+            if pos_ids.max() >= 77:
+                print("WARNING: Text Position IDs are invalid (>= 77). Re-initializing them...")
+                # CLIP max_position_embeddings is usually 77
+                # Use clone() to ensure it's contiguous and owns its memory
+                new_pos_ids = torch.arange(77).expand((1, -1)).clone()
+                model.text_model.embeddings.position_ids = new_pos_ids
+                print("Fixed Text Position IDs.")
+
+        # 2. Fix Vision Model Position IDs
+        vision_model = getattr(model, "vision_model", getattr(model, "visual_model", None))
+        if vision_model and hasattr(vision_model, "embeddings") and hasattr(vision_model.embeddings, "position_ids"):
+            vis_pos_ids = vision_model.embeddings.position_ids
+            # Check if max value is garbage. Usually size is num_patches + 1
+            # For ViT-L/14 224px: (224/14)^2 + 1 = 257
+            # Let's check the embedding weight size to be sure
+            if hasattr(vision_model.embeddings, "position_embedding") and hasattr(vision_model.embeddings.position_embedding, "weight"):
+                num_pos = vision_model.embeddings.position_embedding.weight.shape[0]
+                if vis_pos_ids.max() >= num_pos:
+                    print(f"WARNING: Vision Position IDs are invalid (max={vis_pos_ids.max()}, limit={num_pos}). Re-initializing...")
+                    new_vis_pos_ids = torch.arange(num_pos).expand((1, -1)).clone()
+                    vision_model.embeddings.position_ids = new_vis_pos_ids
+                    print(f"Fixed Vision Position IDs (Size: {num_pos}).")
+
+        model.set_processor(MODEL_NAME)
+        model.eval()
+
+        # [Workaround] Move only visual parts to GPU, keep text parts on CPU
+        # This avoids CUDA errors during text encoding which seems to be sensitive to index issues on GPU
+        print(f"Moving visual parts to {device}...")
+        if hasattr(model, "vision_model"):
+            model.vision_model.to(device)
+        elif hasattr(model, "visual_model"):
+            model.visual_model.to(device)
+
+        if hasattr(model, "visual_projection"):
+            model.visual_projection.to(device)
+
+        # Ensure text model is on CPU
+        if hasattr(model, "text_model"):
+            model.text_model.to('cpu')
+        if hasattr(model, "text_projection"):
+            model.text_projection.to('cpu')
+
+        # Update model.device if possible, but it's a property usually.
+        # We just need to be careful with input devices.
+
+    except Exception as e:
+        print(f"Error loading BGE-VL: {e}")
+        return [], []
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # Encode Queries (Text)
+    try:
+        with torch.no_grad():
+            # Tokenize prompts
+            inputs = model.processor(text=prompts, return_tensors="pt", padding=True, truncation=True)
+
+            # inputs are on CPU, text_model is on CPU
+            # BGE-VL encode returns tensor
+            query_embeddings = model.encode_text(inputs)
+            query_embeddings = query_embeddings.to(device) # Move result to GPU
+    except RuntimeError as e:
+        if "device-side assert" in str(e):
+            print(f"CUDA Error during text encoding: {e}")
+            print("This usually indicates the Tokenizer produced IDs larger than the Model's embedding size.")
+            return [], []
+        raise e
+
+    all_scores = []
+    all_paths = []
+
+    with torch.no_grad():
+        for bi in range(0, len(image_paths), bs):
+            cache_file = os.path.join(embeddings_path, f"bge_vl_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    batch_doc_embeddings = data['bge_vl_embeddings']
+                    final_bi_paths = data.get('paths', current_batch_paths)
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}. Recomputing.")
+                    os.remove(cache_file)
+                    # Fallthrough to recompute
+
+            # Check again if we need to compute (cache might have been deleted above)
+            if not os.path.exists(cache_file):
+                # Filter valid paths
+                valid_paths = [p for p in current_batch_paths if os.path.exists(p)]
+                if not valid_paths: continue
+
+                try:
+                    # Manual image encoding to handle split devices (Visual on GPU, Text on CPU)
+                    # Open images
+                    pil_images = []
+                    for p in valid_paths:
+                        try:
+                            pil_images.append(Image.open(p).convert("RGB"))
+                        except Exception as e:
+                            print(f"Warning: Could not open {p}: {e}")
+
+                    if not pil_images: continue
+
+                    # Process images
+                    inputs = model.processor(images=pil_images, return_tensors="pt")
+                    # Move to GPU (Visual model is on GPU)
+                    inputs = inputs.to(device)
+
+                    # Encode
+                    # [Fix] Pass pixel_values tensor directly, as encode_image expects a tensor
+                    batch_doc_embeddings = model.encode_image(inputs['pixel_values'])
+
+                except RuntimeError as e:
+                    print(f"CUDA Error during image encoding: {e}")
+                    return [], []
+
+                final_bi_paths = valid_paths
+
+            # Ensure device match
+            batch_doc_embeddings = batch_doc_embeddings.to(device)
+            query_embeddings = query_embeddings.to(device)
+
+            # [Fix] Normalize embeddings for Cosine Similarity
+            batch_doc_embeddings = F.normalize(batch_doc_embeddings, p=2, dim=-1)
+            query_embeddings = F.normalize(query_embeddings, p=2, dim=-1)
+
+            sim_matrix = query_embeddings @ batch_doc_embeddings.T
+            # [Fix] Convert BFloat16 to Float32 before converting to numpy
+            all_scores.append(sim_matrix.float().cpu().numpy())
+            all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1) # [N_q, Total_Docs]
+
+    # Return top-k for each prompt
+    final_paths_list = []
+    final_scores_list = []
+
+    for i in range(len(prompts)):
+        scores = full_scores[i]
+        top_indices = np.argsort(scores)[-k:][::-1]
+
+        top_paths = [all_paths[idx] for idx in top_indices]
+        top_scores = scores[top_indices].tolist()
+
+        final_paths_list.append(top_paths)
+        final_scores_list.append(top_scores)
+
+    # Cleanup to free GPU memory
+    del model
+    torch.cuda.empty_cache()
+
+    return final_paths_list, final_scores_list
+
+def get_qwen2_5_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=50, device='cuda:0', save=False, adapter_path=None):
+    """
+    Qwen2.5-VL Retrieval (VLM2Vec)
+    """
+    try:
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        # Use local path if available
+        local_path = "models/Qwen/Qwen2.5-VL-3B-Instruct"
+        model_name = local_path if os.path.exists(local_path) else "Qwen/Qwen2.5-VL-3B-Instruct"
+
+        print(f"Loading Qwen2.5-VL from {model_name}...")
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            trust_remote_code=True
+        )
+
+        if adapter_path:
+            try:
+                from peft import PeftModel
+                print(f"Loading LoRA adapter from {adapter_path}...")
+                model = PeftModel.from_pretrained(model, adapter_path)
+            except ImportError:
+                print("Warning: peft not installed, cannot load adapter.")
+            except Exception as e:
+                print(f"Error loading adapter: {e}")
+
+        model.eval()
+    except Exception as e:
+        print(f"Error loading Qwen2.5-VL: {e}")
+        return [], []
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # 1. Encode Queries (Text)
+    query_embeddings = []
+    with torch.no_grad():
+        for p in prompts:
+            # Instruction for retrieval
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Retrieve the image that matches the description: {p}"}
+                    ]
+                }
+            ]
+            # Prepare inputs
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(device)
+
+            # Forward pass
+            outputs = model(**inputs, output_hidden_states=True)
+            # Last layer, last token
+            last_hidden_state = outputs.hidden_states[-1]
+            emb = last_hidden_state[:, -1, :] # [1, Dim]
+            query_embeddings.append(emb)
+
+    query_embeddings = torch.cat(query_embeddings, dim=0)
+    query_embeddings = F.normalize(query_embeddings, p=2, dim=-1)
+
+    all_scores = []
+    all_paths = []
+
+    # 2. Encode Documents (Images)
+    from tqdm import tqdm
+    print(f"Encoding {len(image_paths)} images with Qwen2.5-VL (Batch Size: {bs})...")
+    with torch.no_grad():
+        for bi in tqdm(range(0, len(image_paths), bs), desc="Qwen2.5-VL Embedding"):
+            cache_file = os.path.join(embeddings_path, f"qwen2_5_vl_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            batch_doc_embeddings = None
+            final_bi_paths = []
+
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    batch_doc_embeddings = data['embeddings']
+                    final_bi_paths = data.get('paths', current_batch_paths)
+                except: pass
+
+            if batch_doc_embeddings is None and save:
+                images = []
+                valid_paths = []
+                for path in current_batch_paths:
+                    try:
+                        images.append(Image.open(path).convert("RGB"))
+                        valid_paths.append(path)
+                    except: continue
+
+                if not images: continue
+
+                batch_embs = []
+                for img in images:
+                    # Construct message with image
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "Represent this image for retrieval."}
+                            ]
+                        }
+                    ]
+                    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                    inputs = processor(
+                        text=[text_prompt],
+                        images=[img],
+                        return_tensors="pt",
+                        padding=True
+                    ).to(device)
+
+                    outputs = model(**inputs, output_hidden_states=True)
+                    last_hidden_state = outputs.hidden_states[-1]
+                    emb = last_hidden_state[:, -1, :]
+                    batch_embs.append(emb)
+
+                if batch_embs:
+                    batch_doc_embeddings = torch.cat(batch_embs, dim=0)
+                    final_bi_paths = valid_paths
+
+                    if embeddings_path:
+                        os.makedirs(embeddings_path, exist_ok=True)
+                        torch.save({"embeddings": batch_doc_embeddings, "paths": final_bi_paths}, cache_file)
+
+            if batch_doc_embeddings is not None:
+                batch_doc_embeddings = batch_doc_embeddings.to(device)
+                batch_doc_embeddings = F.normalize(batch_doc_embeddings, p=2, dim=-1)
+
+                sim_matrix = query_embeddings @ batch_doc_embeddings.T
+                all_scores.append(sim_matrix.float().cpu().numpy())
+                all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+
+    final_paths_list = []
+    final_scores_list = []
+
+    for i in range(len(prompts)):
+        scores = full_scores[i]
+        top_indices = np.argsort(scores)[-k:][::-1]
+        top_paths = [all_paths[idx] for idx in top_indices]
+        top_scores = scores[top_indices].tolist()
+        final_paths_list.append(top_paths)
+        final_scores_list.append(top_scores)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return final_paths_list, final_scores_list
+
+def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None, adapter_path=None):
     """
     统一检索入口。
     支持 method: 'CLIP', 'SigLIP', 'Hybrid' (RRF Fusion)
@@ -848,6 +1190,44 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
             paths = paths_list[0]
             scores = scores_list[0]
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+            all_retrieved_paths.append(paths)
+            all_retrieved_scores.append(scores)
+
+        elif method == 'BGE-VL':
+            paths_list, scores_list = get_bge_vl_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device, save=True
+            )
+            if paths_list:
+                paths = paths_list[0]
+                scores = scores_list[0]
+            else:
+                print("BGE-VL returned no results.")
+                paths = []
+                scores = []
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores)
+            all_retrieved_paths.append(paths)
+            all_retrieved_scores.append(scores)
+
+        elif method == 'Qwen2.5-VL':
+            paths_list, scores_list = get_qwen2_5_vl_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device, save=True,
+                adapter_path=adapter_path
+            )
+            if paths_list:
+                paths = paths_list[0]
+                scores = scores_list[0]
+            else:
+                paths = []
+                scores = []
 
             if global_memory:
                 paths, scores = global_memory.re_rank(paths, scores)
