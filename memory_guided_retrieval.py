@@ -382,75 +382,6 @@ class GlobalMemory:
 
 
 # Removed ColQwen3 retrieval function as requested
-                for path in current_batch_paths:
-                    try:
-                        img_pil = Image.open(path).convert("RGB")
-                        images.append(img_pil)
-                        valid_paths.append(path)
-                    except: continue
-
-                if not images: continue
-
-                # Process Images
-                if hasattr(processor, "process_images"):
-                    batch_images = processor.process_images(images)
-                    # [Refinement] Robust device move
-                    batch_images = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch_images.items()}
-                    image_outputs = model(**batch_images)
-                    batch_doc_embeddings = image_outputs.embeddings
-                else:
-                    inputs = processor(images=images, return_tensors="pt", padding=True).to(device)
-                    batch_doc_embeddings = model(**inputs)
-                    if hasattr(batch_doc_embeddings, 'embeddings'):
-                        batch_doc_embeddings = batch_doc_embeddings.embeddings
-                    elif hasattr(batch_doc_embeddings, 'last_hidden_state'):
-                        batch_doc_embeddings = batch_doc_embeddings.last_hidden_state
-
-                final_bi_paths = valid_paths
-
-                if embeddings_path:
-                    os.makedirs(embeddings_path, exist_ok=True)
-                    torch.save({
-                        "embeddings": batch_doc_embeddings,
-                        "paths": final_bi_paths
-                    }, cache_file)
-
-            if batch_doc_embeddings is None:
-                continue
-
-            # Compute Similarity (Late Interaction)
-            batch_doc_embeddings = batch_doc_embeddings.to(query_embeddings.dtype)
-
-            for i in range(len(prompts)):
-                Q = query_embeddings[i] # [L_q, D]
-                D = batch_doc_embeddings # [B, L_d, D]
-
-                # Sim: [B, L_q, L_d]
-                sim_matrix = torch.einsum('qd,bnd->bqn', Q, D)
-                # Max over doc tokens: [B, L_q]
-                max_sim_scores = sim_matrix.max(dim=-1).values
-                # Sum over query tokens: [B]
-                scores = max_sim_scores.sum(dim=-1)
-
-                results_per_prompt[i]['paths'].extend(final_bi_paths)
-                results_per_prompt[i]['scores'].extend(scores.cpu().tolist())
-
-    # Sort and truncate
-    final_paths_list = []
-    final_scores_list = []
-
-    for i in range(len(prompts)):
-        paths = results_per_prompt[i]['paths']
-        scores = results_per_prompt[i]['scores']
-
-        combined = sorted(zip(paths, scores), key=lambda x: x[1], reverse=True)
-        combined = combined[:k]
-
-        p, s = zip(*combined) if combined else ([], [])
-        final_paths_list.append(list(p))
-        final_scores_list.append(list(s))
-
-    return final_paths_list, final_scores_list
 
 def get_bge_vl_similarities(prompts, image_paths, embeddings_path="", bs=32, k=50, device='cuda:0', save=False):
     """
@@ -794,68 +725,179 @@ def get_qwen2_5_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, 
 
     return final_paths_list, final_scores_list
 
+def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=50, device='cuda:0', save=False, adapter_path=None):
+    """
+    Qwen3-VL Retrieval
+    """
+    try:
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        # Use local path
+        model_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
+
+        print(f"Loading Qwen3-VL from {model_name}...")
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            trust_remote_code=True
+        )
+
+        if adapter_path:
+            try:
+                from peft import PeftModel
+                print(f"Loading LoRA adapter from {adapter_path}...")
+                model = PeftModel.from_pretrained(model, adapter_path)
+            except ImportError:
+                print("Warning: peft not installed, cannot load adapter.")
+            except Exception as e:
+                print(f"Error loading adapter: {e}")
+
+        model.eval()
+    except Exception as e:
+        print(f"Error loading Qwen3-VL: {e}")
+        return [], []
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # 1. Encode Queries (Text)
+    query_embeddings = []
+    with torch.no_grad():
+        for p in prompts:
+            # Instruction for retrieval
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Retrieve the image that matches the description: {p}"}
+                    ]
+                }
+            ]
+            # Prepare inputs
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(device)
+
+            # Forward pass
+            outputs = model(**inputs, output_hidden_states=True)
+            # Last layer, last token
+            last_hidden_state = outputs.hidden_states[-1]
+            emb = last_hidden_state[:, -1, :] # [1, Dim]
+            query_embeddings.append(emb)
+
+    query_embeddings = torch.cat(query_embeddings, dim=0)
+    query_embeddings = F.normalize(query_embeddings, p=2, dim=-1)
+
+    all_scores = []
+    all_paths = []
+
+    # 2. Encode Documents (Images)
+    from tqdm import tqdm
+    print(f"Encoding {len(image_paths)} images with Qwen3-VL (Batch Size: {bs})...")
+    with torch.no_grad():
+        for bi in tqdm(range(0, len(image_paths), bs), desc="Qwen3-VL Embedding"):
+            cache_file = os.path.join(embeddings_path, f"qwen3_vl_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            batch_doc_embeddings = None
+            final_bi_paths = []
+
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    batch_doc_embeddings = data['embeddings']
+                    final_bi_paths = data.get('paths', current_batch_paths)
+                except: pass
+
+            if batch_doc_embeddings is None and save:
+                images = []
+                valid_paths = []
+                for path in current_batch_paths:
+                    try:
+                        images.append(Image.open(path).convert("RGB"))
+                        valid_paths.append(path)
+                    except: continue
+
+                if not images: continue
+
+                batch_embs = []
+                for img in images:
+                    # Construct message with image
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "Represent this image for retrieval."}
+                            ]
+                        }
+                    ]
+                    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                    inputs = processor(
+                        text=[text_prompt],
+                        images=[img],
+                        return_tensors="pt",
+                        padding=True
+                    ).to(device)
+
+                    outputs = model(**inputs, output_hidden_states=True)
+                    last_hidden_state = outputs.hidden_states[-1]
+                    emb = last_hidden_state[:, -1, :]
+                    batch_embs.append(emb)
+
+                if batch_embs:
+                    batch_doc_embeddings = torch.cat(batch_embs, dim=0)
+                    final_bi_paths = valid_paths
+
+                    if embeddings_path:
+                        os.makedirs(embeddings_path, exist_ok=True)
+                        torch.save({"embeddings": batch_doc_embeddings, "paths": final_bi_paths}, cache_file)
+
+            if batch_doc_embeddings is not None:
+                batch_doc_embeddings = batch_doc_embeddings.to(device)
+                batch_doc_embeddings = F.normalize(batch_doc_embeddings, p=2, dim=-1)
+
+                sim_matrix = query_embeddings @ batch_doc_embeddings.T
+                all_scores.append(sim_matrix.float().cpu().numpy())
+                all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+
+    final_paths_list = []
+    final_scores_list = []
+
+    for i in range(len(prompts)):
+        scores = full_scores[i]
+        top_indices = np.argsort(scores)[-k:][::-1]
+        top_paths = [all_paths[idx] for idx in top_indices]
+        top_scores = scores[top_indices].tolist()
+        final_paths_list.append(top_paths)
+        final_scores_list.append(top_scores)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return final_paths_list, final_scores_list
+
 def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None, adapter_path=None):
     """
     统一检索入口。
-    支持 method: 'CLIP', 'SigLIP', 'Hybrid' (RRF Fusion)
     支持 global_memory: 用于 Re-ranking (Penalize history)
     """
     all_retrieved_paths = []
     all_retrieved_scores = []
 
     for caption in captions:
-        if method == 'Hybrid':
-            # 1. Get CLIP Results (Top-K * 2 to ensure overlap)
-            k_expanded = k * 2
-            paths_c, scores_c = get_clip_similarities(
-                [caption], image_paths,
-                embeddings_path=embeddings_path,
-                k=k_expanded, device=device
-            )
-
-            # 2. Get SigLIP Results
-            paths_s, scores_s = get_siglip_similarities(
-                [caption], image_paths,
-                embeddings_path=embeddings_path,
-                k=k_expanded, device=device, save=True
-            )
-
-            # 3. Reciprocal Rank Fusion (RRF)
-            # Score = 1 / (k + rank)
-            rrf_scores = {}
-
-            # Process CLIP
-            for rank, path in enumerate(paths_c):
-                if path not in rrf_scores: rrf_scores[path] = 0.0
-                rrf_scores[path] += 1.0 / (60 + rank)
-
-            # Process SigLIP
-            for rank, path in enumerate(paths_s):
-                if path not in rrf_scores: rrf_scores[path] = 0.0
-                rrf_scores[path] += 1.0 / (60 + rank)
-
-            # Sort by RRF score
-            sorted_paths = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-
-            # [Global Memory Re-ranking]
-            # Apply before truncation to k, to allow lower-ranked items to bubble up if top ones are penalized
-            if global_memory:
-                # Convert RRF scores to list for re-ranking
-                temp_scores = [rrf_scores[p] * 30.0 for p in sorted_paths]
-                # Only use re_rank to adjust scores based on memory model, do NOT exclude
-                sorted_paths, temp_scores = global_memory.re_rank(sorted_paths, temp_scores)
-                # Update final scores map for the truncated list
-                # (Actually we just need the sorted list and scores)
-                final_scores = temp_scores[:k]
-                sorted_paths = sorted_paths[:k]
-            else:
-                sorted_paths = sorted_paths[:k]
-                final_scores = [rrf_scores[p] * 30.0 for p in sorted_paths]
-
-            all_retrieved_paths.append(sorted_paths)
-            all_retrieved_scores.append(final_scores)
-
-        elif method == 'CLIP':
+        if method == 'CLIP':
             paths, scores = get_clip_similarities(
                 [caption], image_paths,
                 embeddings_path=embeddings_path,
@@ -889,7 +931,7 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
 
             if global_memory:
-                paths, scores = global_memory.re_rank(paths, scores)
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
 
             all_retrieved_paths.append(paths)
             all_retrieved_scores.append(scores)
@@ -916,6 +958,25 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 scores = scores_list[0]
             else:
                 print("BGE-VL returned no results.")
+                paths = []
+                scores = []
+
+            if global_memory:
+                paths, scores = global_memory.re_rank(paths, scores, prompt=caption)
+            all_retrieved_paths.append(paths)
+            all_retrieved_scores.append(scores)
+
+        elif method == 'Qwen3-VL':
+            paths_list, scores_list = get_qwen3_vl_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device, save=True,
+                adapter_path=adapter_path
+            )
+            if paths_list:
+                paths = paths_list[0]
+                scores = scores_list[0]
+            else:
                 paths = []
                 scores = []
 

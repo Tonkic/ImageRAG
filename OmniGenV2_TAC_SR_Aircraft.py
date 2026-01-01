@@ -47,7 +47,8 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher guidance for composition
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
+parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter (for Qwen2.5-VL)")
 
 args = parser.parse_args()
 
@@ -278,30 +279,55 @@ if __name__ == "__main__":
 
             # B. Static Retrieval (Simplified for SR)
             query = f"{class_name} {class_name}. {refined_prompt}"
-            if len(query) > 300: query = query[:300]
+            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
+                if len(query) > 300: query = query[:300]
 
             # [Token Length Check]
-            from memory_guided_retrieval import check_token_length
-            check_token_length([query], device="cpu", method=args.retrieval_method)
+            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
+                from memory_guided_retrieval import check_token_length
+                check_token_length([query], device="cpu", method=args.retrieval_method)
+
+            best_ref = None
+            best_ref_score = 0.0
 
             try:
                 retrieved_lists, retrieved_scores = retrieve_img_per_caption(
                     [query], retrieval_db,
                     embeddings_path=args.embeddings_path,
-                    k=1, device="cuda", method=args.retrieval_method
+                    k=1, device="cuda", method=args.retrieval_method,
+                    adapter_path=args.adapter_path
                 )
-                best_ref = retrieved_lists[0][0]
-                best_ref_score = retrieved_scores[0][0]
+                if retrieved_lists and retrieved_lists[0]:
+                    best_ref = retrieved_lists[0][0]
+                    best_ref_score = retrieved_scores[0][0]
+                else:
+                    raise ValueError("Empty retrieval result")
             except Exception as e:
-                f_log.write(f">> Retrieval Error: {e}\n")
-                # Fallback
-                retrieved_lists, retrieved_scores = retrieve_img_per_caption(
-                    [prompt], retrieval_db,
-                    embeddings_path=args.embeddings_path,
-                    k=1, device="cuda:0", method=args.retrieval_method
-                )
-                best_ref = retrieved_lists[0][0]
-                best_ref_score = retrieved_scores[0][0]
+                f_log.write(f">> Retrieval Error (Query): {e}\n")
+                # Fallback to prompt
+                try:
+                    retrieved_lists, retrieved_scores = retrieve_img_per_caption(
+                        [prompt], retrieval_db,
+                        embeddings_path=args.embeddings_path,
+                        k=1, device="cuda", method=args.retrieval_method,
+                        adapter_path=args.adapter_path
+                    )
+                    if retrieved_lists and retrieved_lists[0]:
+                        best_ref = retrieved_lists[0][0]
+                        best_ref_score = retrieved_scores[0][0]
+                    else:
+                        raise ValueError("Empty retrieval result in fallback")
+                except Exception as e2:
+                     f_log.write(f">> Retrieval Error (Fallback): {e2}\n")
+                     # Final Fallback: Random
+                     import random
+                     if retrieval_db:
+                         best_ref = random.choice(retrieval_db)
+                         best_ref_score = 0.0
+                         f_log.write(f">> Retrieval Failed completely. Using Random image: {best_ref}\n")
+                     else:
+                         f_log.write(f">> Retrieval Failed and DB empty. Skipping generation.\n")
+                         continue
 
             f_log.write(f">> Static Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
 

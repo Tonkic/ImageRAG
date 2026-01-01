@@ -206,6 +206,100 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
     return top_paths, top_scores
 
 
+def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0', save=False):
+    """
+    SigLIP2 Retrieval (google/siglip2-base-patch16-224)
+    """
+    try:
+        from transformers import AutoModel, AutoProcessor
+        model_name = "google/siglip2-base-patch16-224"
+        # Use flash_attention_2 if available for efficiency, though not strictly required
+        # The user doc mentions attn_implementation="flash_attention_2"
+        model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa").to(device).eval()
+        processor = AutoProcessor.from_pretrained(model_name)
+    except Exception as e:
+        print(f"Error loading SigLIP2: {e}")
+        return [], []
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # Process Text
+    # Note: SigLIP2 expects padding="max_length" and max_length=64
+    try:
+        text_inputs = processor(text=prompts, padding="max_length", max_length=64, return_tensors="pt").to(device)
+    except Exception as e:
+        print(f"Error processing text for SigLIP2: {e}")
+        return [], []
+
+    all_scores = []
+    all_paths = []
+
+    with torch.no_grad():
+        text_features = model.get_text_features(**text_inputs)
+        normalized_text_vectors = F.normalize(text_features, dim=-1)
+
+        for bi in range(0, len(image_paths), bs):
+            cache_file = os.path.join(embeddings_path, f"siglip2_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    normalized_im_vectors = data['normalized_siglip2_embeddings']
+                    final_bi_paths = data.get('paths', current_batch_paths)
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
+                    normalized_im_vectors = None
+
+            if not os.path.exists(cache_file) or normalized_im_vectors is None:
+                if not save: continue
+
+                images = []
+                valid_paths = []
+                for path in current_batch_paths:
+                    try:
+                        img_pil = Image.open(path).convert("RGB")
+                        images.append(img_pil)
+                        valid_paths.append(path)
+                    except: continue
+
+                if not images: continue
+
+                # Process Images
+                image_inputs = processor(images=images, return_tensors="pt").to(device)
+                image_features = model.get_image_features(**image_inputs)
+                normalized_im_vectors = F.normalize(image_features, dim=-1)
+                final_bi_paths = valid_paths
+
+                if embeddings_path:
+                    os.makedirs(embeddings_path, exist_ok=True)
+                    torch.save({
+                        "normalized_siglip2_embeddings": normalized_im_vectors,
+                        "paths": final_bi_paths
+                    }, cache_file)
+
+            # Ensure dtype consistency
+            normalized_im_vectors = normalized_im_vectors.to(normalized_text_vectors.dtype)
+            sim_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
+            all_scores.append(sim_matrix.cpu().numpy())
+            all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+    single_prompt_scores = full_scores[0]
+
+    k = min(k, len(single_prompt_scores))
+    top_indices = np.argsort(single_prompt_scores)[-k:][::-1]
+
+    top_paths = [all_paths[i] for i in top_indices]
+    top_scores = single_prompt_scores[top_indices].tolist()
+
+    return top_paths, top_scores
+
+
 def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP'):
     """
     统一入口函数。
@@ -225,6 +319,12 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             )
         elif method == 'SigLIP':
             paths, scores = get_siglip_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device, save=True
+            )
+        elif method == 'SigLIP2':
+            paths, scores = get_siglip2_similarities(
                 [caption], image_paths,
                 embeddings_path=embeddings_path,
                 k=k, device=device, save=True

@@ -12,26 +12,26 @@ from transformers.utils.import_utils import is_flash_attn_2_available
 
 class MemoryProjector(nn.Module):
     """
-    MemoRAG-inspired Compact Memory Module.
-    Compresses variable-length image sequences into fixed-size memory tokens,
-    then allows text to query this compressed memory.
+    MemoRAG 风格的紧凑记忆模块。
+    将变长的图像序列压缩为固定大小的记忆 Token，
+    然后允许文本查询这个压缩后的记忆。
     """
     def __init__(self, input_dim=128, hidden_dim=256, num_memory_tokens=16, num_heads=4):
         super().__init__()
 
-        # [MemoRAG] Learnable Memory Tokens (Latent Queries)
-        # Compresses N image patches into K memory tokens
+        # [MemoRAG] 可学习的记忆 Token (潜在查询)
+        # 将 N 个图像 Patch 压缩为 K 个记忆 Token
         self.memory_tokens = nn.Parameter(torch.randn(1, num_memory_tokens, input_dim))
 
-        # Compressor: Memory Tokens attend to Image Patches
+        # 压缩器: 记忆 Token 关注图像 Patch
         # Query=Memory, Key=Image, Value=Image
         self.compressor = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
 
-        # Retrieval: Text attends to Compressed Memory
+        # 检索: 文本关注压缩后的记忆
         # Query=Text, Key=Memory, Value=Memory
         self.cross_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
 
-        # Scoring Head
+        # 评分头
         self.score_head = nn.Sequential(
             nn.Linear(input_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -45,21 +45,21 @@ class MemoryProjector(nn.Module):
         # text_seq: [Batch, Seq_txt, Dim]
         batch_size = img_seq.shape[0]
 
-        # 1. Memory Formation (Compression)
-        # Expand memory tokens for batch
+        # 1. 记忆形成 (压缩)
+        # 为 Batch 扩展记忆 Token
         mem_query = self.memory_tokens.repeat(batch_size, 1, 1) # [B, K, D]
 
         # Q=Memory, K=Image, V=Image
         compressed_mem, _ = self.compressor(query=mem_query, key=img_seq, value=img_seq)
         # compressed_mem: [B, K, D]
 
-        # 2. Retrieval (Text queries Memory)
+        # 2. 检索 (文本查询记忆)
         # Q=Text, K=Memory, V=Memory
         attn_out, _ = self.cross_attn(query=text_seq, key=compressed_mem, value=compressed_mem)
         # attn_out: [B, Seq_txt, D]
 
-        # 3. Aggregation
-        # Mean pool text context and original text
+        # 3. 聚合
+        # 对文本上下文和原始文本进行平均池化
         txt_context = attn_out.mean(dim=1) # [B, D]
         txt_original = text_seq.mean(dim=1) # [B, D]
 
@@ -76,44 +76,45 @@ class GlobalMemory:
         self.adapter_path = adapter_path
 
         # self.memory = self._load_memory()
-        self.memory = [] # Always start fresh to ensure experiment independence
+        self.memory = [] # 始终重新开始以确保实验独立性
 
-        # Initialize history for Taboo Search
+        # 初始化 Taboo Search 的历史记录
         self.history = set()
 
-        # [Lazy Loading] Do not load models immediately to save VRAM
+        # [懒加载] 不立即加载模型以节省 VRAM
         self.model = None
         self.processor = None
 
-        # Projector will be initialized after model loading when dim is known
+        # Projector 将在模型加载且维度已知后初始化
         self.projector = None
 
-        # Default model names
-        self.qwen_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+        # 默认模型名称
+        self.qwen_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
 
-        print(f"Initialized new Global Memory Model (In-Memory Only). Embedding: {self.embedding_model_type}")
+        print(f"初始化新的全局记忆模型 (仅内存)。Embedding: {self.embedding_model_type}")
 
     def _load_model(self):
-        """Lazy load the appropriate embedding model."""
+        """加载指定的 Embedding 模型 (Qwen2.5-VL 或 Qwen3-VL)"""
         if self.model is not None:
             return
 
-        if self.embedding_model_type == "Qwen2.5-VL":
-            self._load_qwen2_5_vl()
-        else:
-            print(f"Warning: Unknown embedding model type '{self.embedding_model_type}'. Defaulting to Qwen2.5-VL.")
-            self._load_qwen2_5_vl()
-
-    def _load_qwen2_5_vl(self):
-        print(f"Loading Qwen2.5-VL for Global Memory (Adapter: {self.adapter_path})...")
-        try:
-            # Use local path if available
+        model_name_or_path = ""
+        if self.embedding_model_type == "Qwen3-VL":
+            print(f"正在加载 Qwen3-VL 用于全局记忆 (Adapter: {self.adapter_path})...")
+            model_name_or_path = self.qwen_name
+        elif self.embedding_model_type == "Qwen2.5-VL":
+            print(f"正在加载 Qwen2.5-VL 用于全局记忆 (Adapter: {self.adapter_path})...")
             local_path = "models/Qwen/Qwen2.5-VL-3B-Instruct"
-            model_name = local_path if os.path.exists(local_path) else self.qwen_name
-
-            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            model_name_or_path = local_path if os.path.exists(local_path) else "Qwen/Qwen2.5-VL-3B-Instruct"
+        else:
+            # 默认为 Qwen3-VL
+            print(f"警告: 未知的 embedding 模型类型 '{self.embedding_model_type}'。默认为 Qwen3-VL。")
+            print(f"正在加载 Qwen3-VL 用于全局记忆 (Adapter: {self.adapter_path})...")
+            model_name_or_path = self.qwen_name
+        try:
+            self.processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True)
             self.model = AutoModelForVision2Seq.from_pretrained(
-                model_name,
+                model_name_or_path,
                 torch_dtype=torch.bfloat16,
                 device_map=self.device,
                 trust_remote_code=True
@@ -122,30 +123,28 @@ class GlobalMemory:
             if self.adapter_path:
                 try:
                     from peft import PeftModel
-                    print(f"Loading LoRA adapter from {self.adapter_path}...")
+                    print(f"正在加载 LoRA adapter: {self.adapter_path}...")
                     self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
                 except ImportError:
-                    print("Warning: peft not installed, cannot load adapter.")
+                    print("警告: 未安装 peft，无法加载 adapter。")
                 except Exception as e:
-                    print(f"Error loading adapter: {e}")
+                    print(f"加载 adapter 出错: {e}")
 
-            # Determine hidden size from config
+            # 确定 hidden_size 并初始化 Projector
+            hidden_size = 2048 # 默认值
             if hasattr(self.model.config, "hidden_size"):
                 hidden_size = self.model.config.hidden_size
             elif hasattr(self.model.config, "text_config") and hasattr(self.model.config.text_config, "hidden_size"):
                 hidden_size = self.model.config.text_config.hidden_size
-            else:
-                print("Warning: Could not determine hidden size from config, defaulting to 2048 (Qwen2.5-VL-3B).")
-                hidden_size = 2048
 
-            print(f"Qwen2.5-VL Hidden Size: {hidden_size}")
+            print(f"{self.embedding_model_type} Hidden Size: {hidden_size}")
 
-            # Initialize projector
             if self.projector is None:
                 self.projector = MemoryProjector(input_dim=hidden_size).to(self.device)
 
         except Exception as e:
-            print(f"Error loading Qwen2.5-VL: {e}")
+            print(f"加载模型出错: {e}")
+            self.model = None
             raise e
 
     def _load_memory(self):
@@ -228,56 +227,49 @@ class GlobalMemory:
 
     def _get_sequence_embedding(self, image_path=None, prompt_text=None):
         """
-        Helper: Extract embeddings as SEQUENCES (No Pooling).
-        Returns a float32 tensor of shape [Seq_Len, Dim].
+        辅助函数: 提取序列 Embedding (不进行 Pooling)。
+        返回 shape 为 [Seq_Len, Dim] 的 float32 tensor。
         """
-        self._load_model() # Ensure model is loaded
+        self._load_model() # 确保模型已加载
 
-        with torch.no_grad():
-            # --- Qwen2.5-VL Logic ---
-            if image_path:
-                try:
-                    image = Image.open(image_path).convert("RGB")
-                    # Simple prompt for image feature extraction
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image},
-                                {"type": "text", "text": "Describe this image."}
-                            ]
-                        }
-                    ]
-                    inputs = self.processor.apply_chat_template(
-                        messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
-                    ).to(self.device)
+        messages = []
+        if image_path:
+            try:
+                image = Image.open(image_path).convert("RGB")
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": "Describe this image."}
+                        ]
+                    }
+                ]
+            except Exception as e:
+                print(f"读取图片出错 {image_path}: {e}")
+                return None
+        elif prompt_text:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"Retrieve the image that matches the description: {prompt_text}"}]
+                }
+            ]
+        else:
+            return None
 
-                    outputs = self.model(**inputs, output_hidden_states=True)
-                    # Return full sequence of last hidden state
-                    return outputs.hidden_states[-1][0].float()
-                except Exception as e:
-                    print(f"Error embedding image {image_path}: {e}")
-                    return None
+        try:
+            with torch.no_grad():
+                inputs = self.processor.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+                ).to(self.device)
 
-            if prompt_text:
-                try:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [{"type": "text", "text": f"Retrieve the image that matches the description: {prompt_text}"}]
-                        }
-                    ]
-                    inputs = self.processor.apply_chat_template(
-                        messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
-                    ).to(self.device)
-
-                    outputs = self.model(**inputs, output_hidden_states=True)
-                    return outputs.hidden_states[-1][0].float()
-                except Exception as e:
-                    print(f"Error embedding text '{prompt_text}': {e}")
-                    return None
-
-        return None
+                outputs = self.model(**inputs, output_hidden_states=True)
+                # 返回最后一层 hidden state 的完整序列
+                return outputs.hidden_states[-1][0].float()
+        except Exception as e:
+            print(f"提取 Embedding 出错: {e}")
+            return None
 
     def train_model(self, epochs=10, plot_path='global_memory_loss.png'):
         """

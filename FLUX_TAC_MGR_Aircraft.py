@@ -54,7 +54,7 @@ parser.add_argument("--seed", type=int, default=0, help="Global Random Seed")
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=30.0) # FLUX Fill default
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
 
 args = parser.parse_args()
 

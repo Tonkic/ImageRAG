@@ -82,7 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--embeddings_path", type=str, default="")
     parser.add_argument("--mode", type=str, default="sd_first", choices=['sd_first', 'generation'])
     parser.add_argument("--only_rephrase", action='store_true')
-    parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=['CLIP', 'SigLIP', 'MoE', 'gpt_rerank'])
+    parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=['CLIP', 'SigLIP', 'SigLIP2', 'MoE', 'gpt_rerank'])
 
     args = parser.parse_args()
 

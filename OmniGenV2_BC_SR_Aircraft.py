@@ -43,7 +43,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -236,8 +236,9 @@ if __name__ == "__main__":
             # (Since BC doesn't give us fine-grained features to augment the query)
 
             # [Token Length Check]
-            from memory_guided_retrieval import check_token_length
-            check_token_length([prompt], device="cpu", method=args.retrieval_method)
+            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
+                from memory_guided_retrieval import check_token_length
+                check_token_length([prompt], device="cpu", method=args.retrieval_method)
 
             retrieved_lists, _ = retrieve_img_per_caption(
                 [prompt], retrieval_db,

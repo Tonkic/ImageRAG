@@ -44,7 +44,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid", "colqwen3", "Qwen2.5-VL"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "colqwen3", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -234,7 +234,12 @@ if __name__ == "__main__":
 
         current_image = v1_path
         retry_cnt = 0
-        global_memory = GlobalMemory()
+
+        memory_model_type = "Qwen2.5-VL"
+        if args.retrieval_method == "Qwen3-VL":
+            memory_model_type = "Qwen3-VL"
+        global_memory = GlobalMemory(embedding_model=memory_model_type)
+
         last_used_ref = None
 
         while retry_cnt < args.max_retries:

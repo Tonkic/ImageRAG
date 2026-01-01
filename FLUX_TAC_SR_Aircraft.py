@@ -52,7 +52,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=30.0)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "ColPali", "Hybrid"], help="Retrieval Model")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
 
 args = parser.parse_args()
 
@@ -224,18 +224,36 @@ def run_flux(pipe, prompt, input_images, output_path, seed):
                     embeddings_path=args.embeddings_path,
                     k=1, device="cuda", method=args.retrieval_method
                 )
-                best_ref = retrieved_lists[0][0]
-                best_ref_score = retrieved_scores[0][0]
+                if retrieved_lists and retrieved_lists[0]:
+                    best_ref = retrieved_lists[0][0]
+                    best_ref_score = retrieved_scores[0][0]
+                else:
+                    raise ValueError("Empty retrieval result")
             except Exception as e:
                 f_log.write(f">> Retrieval Error: {e}\n")
                 # Fallback
-                retrieved_lists, retrieved_scores = retrieve_img_per_caption(
-                    [prompt], retrieval_db,
-                    embeddings_path=args.embeddings_path,
-                    k=1, device="cuda", method=args.retrieval_method
-                )
-                best_ref = retrieved_lists[0][0]
-                best_ref_score = retrieved_scores[0][0]
+                try:
+                    retrieved_lists, retrieved_scores = retrieve_img_per_caption(
+                        [prompt], retrieval_db,
+                        embeddings_path=args.embeddings_path,
+                        k=1, device="cuda", method=args.retrieval_method
+                    )
+                    if retrieved_lists and retrieved_lists[0]:
+                        best_ref = retrieved_lists[0][0]
+                        best_ref_score = retrieved_scores[0][0]
+                    else:
+                        raise ValueError("Empty retrieval result in fallback")
+                except Exception as e2:
+                    f_log.write(f">> Retrieval Error (Fallback): {e2}\n")
+                    # Final Fallback: Random
+                    import random
+                    if retrieval_db:
+                        best_ref = random.choice(retrieval_db)
+                        best_ref_score = 0.0
+                        f_log.write(f">> Retrieval Failed completely. Using Random image: {best_ref}\n")
+                    else:
+                        f_log.write(f">> Retrieval Failed and DB empty. Skipping generation.\n")
+                        continue
 
             f_log.write(f">> Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
 

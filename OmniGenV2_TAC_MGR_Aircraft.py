@@ -43,7 +43,7 @@ parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5) # TAC 逻辑需要较高的图像引导
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
-parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "Hybrid", "BGE-VL", "Qwen2.5-VL"], help="检索模型")
+parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "BGE-VL", "Qwen2.5-VL", "Qwen3-VL"], help="检索模型")
 parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter (for Qwen2.5-VL)")
 
 args = parser.parse_args()
@@ -266,9 +266,14 @@ if __name__ == "__main__":
         retry_cnt = 0
 
         # [MGR 核心]: 用于重排序的全局记忆
+        # 注意: GlobalMemory 目前仅支持 Qwen2.5-VL/Qwen3-VL 作为特征提取器 (MemoRAG Projector)
+        memory_model_type = "Qwen2.5-VL"
+        if args.retrieval_method == "Qwen3-VL":
+            memory_model_type = "Qwen3-VL"
+
         global_memory = GlobalMemory(
             device=retrieval_device,
-            embedding_model=args.retrieval_method,
+            embedding_model=memory_model_type,
             adapter_path=args.adapter_path
         )
         last_used_ref = None
@@ -326,8 +331,8 @@ if __name__ == "__main__":
                  # 如果 LLM 没有返回，则使用回退方案
                  if not query_text or len(query_text) < 5:
                      query_text = f"{class_name} {class_name}"
-            elif args.retrieval_method in ["BGE-VL", "Qwen2.5-VL"]:
-                 # BGE-VL/Qwen2.5-VL: 使用完整的 prompt，不进行截断
+            elif args.retrieval_method in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL"]:
+                 # BGE-VL/Qwen2.5-VL/Qwen3-VL: 使用完整的 prompt，不进行截断
                  query_text = f"{refined_prompt} " + " ".join(mgr_queries)
             else:
                  # 强制注入类别名称以用于长上下文模型
@@ -335,7 +340,7 @@ if __name__ == "__main__":
                  if len(query_text) > 300: query_text = query_text[:300]
 
             # [Token 长度检查]
-            if args.retrieval_method not in ["BGE-VL", "Qwen2.5-VL"]:
+            if args.retrieval_method not in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL"]:
                 from memory_guided_retrieval import check_token_length
                 check_token_length([query_text], device="cpu", method=args.retrieval_method)
 
@@ -422,7 +427,7 @@ if __name__ == "__main__":
         # 重新初始化以确保状态干净，并加载所有累积的记忆
         trainer_memory = GlobalMemory(
             device=retrieval_device,
-            embedding_model=args.retrieval_method,
+            embedding_model="Qwen2.5-VL",
             adapter_path=args.adapter_path
         )
         trainer_memory.memory = all_feedback_memory # 注入收集到的记忆
