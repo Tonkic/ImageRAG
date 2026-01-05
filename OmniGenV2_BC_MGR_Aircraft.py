@@ -45,6 +45,7 @@ parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
 parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "colqwen3", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
+parser.add_argument("--retrieval_datasets", nargs='+', default=['aircraft'], choices=['aircraft', 'cub', 'imagenet'], help="Datasets to use for retrieval")
 
 args = parser.parse_args()
 
@@ -112,17 +113,69 @@ def setup_system():
     return pipe, client
 
 def load_retrieval_db():
-    print(f"Loading Aircraft Retrieval DB...")
-    paths = []
-    with open(DATASET_CONFIG['train_list'], 'r') as f:
-        for line in f.readlines():
-            line = line.strip()
-            if not line: continue
-            img_path = os.path.join(DATASET_CONFIG['image_root'], f"{line}.jpg")
-            if os.path.exists(img_path):
-                paths.append(img_path)
-    print(f"Loaded {len(paths)} images.")
-    return paths
+    print(f"Loading Retrieval DBs: {args.retrieval_datasets}...")
+    all_paths = []
+
+    for ds in args.retrieval_datasets:
+        if ds == 'aircraft':
+            print("  Loading Aircraft...")
+            root = "datasets/fgvc-aircraft-2013b/data/images"
+            list_file = "datasets/fgvc-aircraft-2013b/data/images_train.txt"
+            if os.path.exists(list_file):
+                with open(list_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        path = os.path.join(root, f"{line}.jpg")
+                        if os.path.exists(path):
+                            all_paths.append(path)
+            else:
+                print(f"  Warning: Aircraft list file not found at {list_file}")
+
+        elif ds == 'cub':
+            print("  Loading CUB...")
+            root = "datasets/CUB_200_2011/images"
+            split_file = "datasets/CUB_200_2011/train_test_split.txt"
+            images_file = "datasets/CUB_200_2011/images.txt"
+
+            if os.path.exists(split_file) and os.path.exists(images_file):
+                train_ids = set()
+                with open(split_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 2 and parts[1] == '1':
+                            train_ids.add(parts[0])
+
+                with open(images_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            img_id = parts[0]
+                            rel_path = parts[1]
+                            if img_id in train_ids:
+                                path = os.path.join(root, rel_path)
+                                if os.path.exists(path):
+                                    all_paths.append(path)
+            else:
+                print(f"  Warning: CUB files not found at {split_file} or {images_file}")
+
+        elif ds == 'imagenet':
+            print("  Loading ImageNet...")
+            root = "/home/tingyu/imageRAG/datasets/ILSVRC2012_train"
+            list_file = "/home/tingyu/imageRAG/datasets/imagenet_train_list.txt"
+            if os.path.exists(list_file):
+                with open(list_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line: continue
+                        path = os.path.join(root, line)
+                        if os.path.exists(path):
+                            all_paths.append(path)
+            else:
+                print(f"  Warning: ImageNet list file not found at {list_file}")
+
+    print(f"Total loaded retrieval images: {len(all_paths)}")
+    return all_paths
 
 def run_omnigen(pipe, prompt, input_images, output_path, seed):
     # [关键修复] 防止字符串路径被当做字符列表遍历

@@ -1,14 +1,15 @@
 '''
-OmniGenV2_TAC_SR_Aircraft.py
+OmniGenV2_TAC_exp_SR_Aircraft.py
 =============================
 Configuration:
   - Generator: OmniGen V2
   - Critic: Taxonomy-Aware Critic (TAC) -> Fine-grained diagnosis
   - Retrieval: Static Retrieval (SR) -> No memory/exclusion list
+  - Policy: Training-Free GRPO (Group Relative Policy Optimization) with Experience Library
   - Dataset: FGVC-Aircraft
 
 Usage:
-  python OmniGenV2_TAC_SR_Aircraft.py \
+  python OmniGenV2_TAC_exp_SR_Aircraft.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
@@ -19,6 +20,23 @@ Usage:
 import argparse
 import sys
 import os
+import json
+import shutil
+import numpy as np
+import torch
+import random
+from PIL import Image
+from tqdm import tqdm
+import openai
+import clip
+import time
+import base64
+import io
+import psutil
+import threading
+import matplotlib.pyplot as plt
+import datetime
+
 # [Proxy Config] Clear system proxies for direct connection
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
@@ -27,7 +45,7 @@ os.environ.pop("https_proxy", None)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + SR (Aircraft)")
+parser = argparse.ArgumentParser(description="OmniGenV2 + TAC + exp + SR (Aircraft)")
 
 # Core Config
 parser.add_argument("--device_id", type=str, required=True, help="Main device ID (e.g. '0' or '0,1')")
@@ -45,7 +63,6 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Inst
 # Local Weights Config
 parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
 parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
-parser.add_argument("--enable_offload", action="store_true", help="Enable CPU offloading for OmniGen to save VRAM")
 
 # Params
 parser.add_argument("--seed", type=int, default=0)
@@ -55,6 +72,7 @@ parser.add_argument("--image_guidance_scale", type=float, default=1.5) # Higher 
 parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
 parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
 parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter (for Qwen2.5-VL)")
+parser.add_argument("--group_size", type=int, default=4, help="Group size for GRPO")
 parser.add_argument("--retrieval_datasets", nargs='+', default=['aircraft'], choices=['aircraft', 'cub', 'imagenet'], help="Datasets to use for retrieval")
 
 args = parser.parse_args()
@@ -64,45 +82,51 @@ if args.vlm_device_id:
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.device_id},{args.vlm_device_id}"
     omnigen_device = "cuda:0"
     vlm_device_map = {"": "cuda:1"}
+    retrieval_device = "cuda:1" # Offload retrieval to VLM GPU
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
     omnigen_device = "cuda:0"
     vlm_device_map = "auto"
+    retrieval_device = "cuda:0"
 
 print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
-
-import json
-import shutil
-import numpy as np
-import torch
-print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
-import random
-from PIL import Image
-from tqdm import tqdm
-import openai
-import clip
+print(f"DEBUG: OmniGen Device: {omnigen_device}, VLM Device Map: {vlm_device_map}, Retrieval Device: {retrieval_device}")
+print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices.")
 
 # [IMPORTS]
-from taxonomy_aware_critic import taxonomy_aware_diagnosis # The new Critic
+from taxonomy_aware_critic import (
+    taxonomy_aware_diagnosis, # The new Critic
+    rate_image_match,
+    extract_semantic_advantage,
+    message_gpt,
+    encode_image
+)
 from memory_guided_retrieval import retrieve_img_per_caption      # The Static Retrieval logic
-from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient
+from rag_utils import (
+    ResourceMonitor,
+    UsageTrackingClient,
+    ExperienceLibrary,
+    LocalQwen3VLWrapper,
+    seed_everything,
+    RUN_STATS
+)
 
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# --- Global Stats & Monitoring ---
+# RUN_STATS is imported from rag_utils
 
 # --- 2. Config ---
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_SR_Aircraft"
+    "output_path": "results/OmniGenV2_TAC_exp_SR_Aircraft"
 }
+
+# --- Experience Library ---
+# ExperienceLibrary is imported from rag_utils
+
+# --- Local Qwen3-VL Wrapper ---
+# LocalQwen3VLWrapper is imported from rag_utils
 
 # --- 3. Setup ---
 def setup_system(omnigen_device, vlm_device_map):
@@ -113,27 +137,18 @@ def setup_system(omnigen_device, vlm_device_map):
         pipe = OmniGen2Pipeline.from_pretrained(
             args.omnigen2_model_path,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True, # Required for custom code
+            trust_remote_code=True,
         )
-        # Patch for missing attribute
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-        if args.enable_offload:
-            print("Enabling model CPU offload for OmniGen...")
-            pipe.enable_model_cpu_offload(device=omnigen_device)
-        else:
-            pipe.to(omnigen_device)
+        pipe.to(omnigen_device)
     except ImportError as e:
         print(f"Error: OmniGen2 not found. Details: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-    # os.environ.pop("http_proxy", None)
-    # os.environ.pop("https_proxy", None)
-    # os.environ.pop("all_proxy", None)
 
     print("Initializing Client...")
     # Logic: Explicit Local Flag OR Missing API Key -> Use Local Weights
@@ -247,7 +262,6 @@ def run_omnigen(pipe, prompt, input_images, output_path, seed, img_guidance_scal
 
 # --- 4. Main ---
 if __name__ == "__main__":
-    import time
     start_time = time.time()
 
     seed_everything(args.seed)
@@ -256,13 +270,12 @@ if __name__ == "__main__":
     retrieval_db = load_db()
     print("Pre-calculating/Loading retrieval embeddings on GPU...")
     try:
-        # Run a dummy retrieval on the FULL database to force caching
         retrieve_img_per_caption(
             ["warmup_query"],
             retrieval_db,
             embeddings_path=args.embeddings_path,
             k=1,
-            device="cuda",
+            device=retrieval_device,
             method=args.retrieval_method
         )
         torch.cuda.empty_cache()
@@ -271,12 +284,15 @@ if __name__ == "__main__":
         print(f"Warning during embedding caching: {e}")
 
     pipe, client = setup_system(omnigen_device, vlm_device_map)
-    # retrieval_db = load_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     # Create logs directory
     logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
     os.makedirs(logs_dir, exist_ok=True)
+
+    # Start Resource Monitor
+    monitor = ResourceMonitor(interval=1.0)
+    monitor.start()
 
     # Save Run Configuration
     config_path = os.path.join(logs_dir, "run_config.txt")
@@ -287,14 +303,19 @@ if __name__ == "__main__":
             f.write(f"{arg}: {getattr(args, arg)}\n")
         f.write(f"\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
 
-
     with open(DATASET_CONFIG['classes_txt']) as f:
         all_classes = [l.strip() for l in f.readlines() if l.strip()]
 
     my_tasks = [c for i, c in enumerate(all_classes) if i % args.total_chunks == args.task_index]
     print(f"Processing {len(my_tasks)} classes.")
 
+    # Initialize Experience Library
+    experience_lib = ExperienceLibrary()
+
     for class_name in tqdm(my_tasks):
+        # [Reset Specific Rules]
+        experience_lib.reset_specific()
+
         safe_name = class_name.replace(" ", "_").replace("/", "-")
         prompt = f"a photo of a {class_name}"
 
@@ -311,11 +332,9 @@ if __name__ == "__main__":
 
         if not os.path.exists(v1_path):
             if os.path.exists(baseline_v1_path):
-                # print(f"Copying V1 from baseline: {baseline_v1_path}")
                 shutil.copy(baseline_v1_path, v1_path)
             else:
                 run_omnigen(pipe, prompt, [], v1_path, args.seed)
-                # Try to populate baseline
                 try:
                     os.makedirs(baseline_dir, exist_ok=True)
                     shutil.copy(v1_path, baseline_v1_path)
@@ -337,22 +356,18 @@ if __name__ == "__main__":
             f_log.write(f"Reference Specs Retrieval Failed: {e}\n")
             reference_specs = None
 
-        # Loop (Static Retrieval = No Exclusion List)
+        # Loop (Group Rollout)
         while retry_cnt < args.max_retries:
-            f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
+            f_log.write(f"\n--- Retry {retry_cnt+1} (Group Rollout) ---\n")
 
-            # A. TAC Diagnosis (V4.0)
+            # A. Diagnosis of current best (to get critique)
             diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model, reference_specs=reference_specs)
-
             score = diagnosis.get('final_score', 0)
             taxonomy_status = diagnosis.get('taxonomy_check', 'unknown')
             critique = diagnosis.get('critique', '')
-            refined_prompt = diagnosis.get('refined_prompt', prompt)
 
-            f_log.write(f"Decision: Score {score} | Taxonomy: {taxonomy_status}\nCritique: {critique}\n")
-            f_log.write(f"Full Diagnosis: {json.dumps(diagnosis, indent=2)}\n")
+            f_log.write(f"Current Best Score: {score} | Taxonomy: {taxonomy_status}\nCritique: {critique}\n")
 
-            # Update Best
             if score > best_score:
                 best_score = score
                 best_image_path = current_image
@@ -362,87 +377,134 @@ if __name__ == "__main__":
                 shutil.copy(current_image, os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png"))
                 break
 
-            # B. Static Retrieval (Simplified for SR)
-            query = f"{class_name} {class_name}. {refined_prompt}"
-            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
-                if len(query) > 300: query = query[:300]
+            # B. Group Rollout
+            group_results = []
+            context_str = experience_lib.get_context_str()
 
-            # [Token Length Check]
-            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
-                from memory_guided_retrieval import check_token_length
-                check_token_length([query], device="cpu", method=args.retrieval_method)
+            # Base instruction for query generation
+            instruction = f"The current image of {class_name} has issues: {critique}. \n" \
+                          f"We need to retrieve a better reference image to fix these issues. \n" \
+                          f"Refine the retrieval query for {class_name}. \n" \
+                          f"{context_str}\n" \
+                          f"Output ONLY the retrieval query string."
 
-            best_ref = None
-            best_ref_score = 0.0
+            f_log.write(f"Experience Context: {context_str}\n")
 
-            try:
-                retrieved_lists, retrieved_scores = retrieve_img_per_caption(
-                    [query], retrieval_db,
-                    embeddings_path=args.embeddings_path,
-                    k=1, device="cuda", method=args.retrieval_method,
-                    adapter_path=args.adapter_path
-                )
-                if retrieved_lists and retrieved_lists[0]:
-                    best_ref = retrieved_lists[0][0]
-                    best_ref_score = retrieved_scores[0][0]
-                else:
-                    raise ValueError("Empty retrieval result")
-            except Exception as e:
-                f_log.write(f">> Retrieval Error (Query): {e}\n")
-                # Fallback to prompt
+            for i in range(args.group_size):
+                f_log.write(f"  > Group Member {i+1}/{args.group_size}...\n")
+
+                # a. Generate Query Variation
+                # Use high temperature for diversity
+                variation_query = message_gpt(instruction, client, model=args.llm_model, temperature=0.9)
+                if not variation_query: variation_query = f"{class_name} {class_name}"
+
+                # Clean up query (remove quotes etc if any)
+                variation_query = variation_query.replace('"', '').replace("'", "").strip()
+
+                # b. Retrieve
                 try:
                     retrieved_lists, retrieved_scores = retrieve_img_per_caption(
-                        [prompt], retrieval_db,
+                        [variation_query], retrieval_db,
                         embeddings_path=args.embeddings_path,
-                        k=1, device="cuda", method=args.retrieval_method,
+                        k=3, device=retrieval_device, method=args.retrieval_method,
                         adapter_path=args.adapter_path
                     )
-                    if retrieved_lists and retrieved_lists[0]:
-                        best_ref = retrieved_lists[0][0]
-                        best_ref_score = retrieved_scores[0][0]
+                    candidates = retrieved_lists[0]
+
+                    best_candidate = None
+                    best_confidence = -1
+
+                    # [Modified] Best-of-N Selection
+                    for img_path in candidates:
+                        score = rate_image_match(img_path, class_name, reference_specs, client, args.llm_model)
+                        if score > best_confidence:
+                            best_confidence = score
+                            best_candidate = img_path
+
+                    if best_confidence >= 3:
+                        ref_img = best_candidate
+                        f_log.write(f"    >> Selected ref {os.path.basename(ref_img)} with confidence {best_confidence}/10.\n")
                     else:
-                        raise ValueError("Empty retrieval result in fallback")
-                except Exception as e2:
-                     f_log.write(f">> Retrieval Error (Fallback): {e2}\n")
-                     # Final Fallback: Random
-                     import random
-                     if retrieval_db:
-                         best_ref = random.choice(retrieval_db)
-                         best_ref_score = 0.0
-                         f_log.write(f">> Retrieval Failed completely. Using Random image: {best_ref}\n")
-                     else:
-                         f_log.write(f">> Retrieval Failed and DB empty. Skipping generation.\n")
-                         continue
+                        ref_img = None
+                        f_log.write(f"    >> All refs rejected (Best Score: {best_confidence}). Fallback to Text-Only.\n")
 
-            f_log.write(f">> Static Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
+                except Exception as e:
+                    f_log.write(f"    Retrieval failed: {e}. Using random.\n")
+                    if retrieval_db: ref_img = random.choice(retrieval_db)
+                    else: continue
 
-            # C. Generation Strategy
-            next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
+                # c. Generate Image (Seed Offset)
+                trial_seed = args.seed + retry_cnt * 100 + i # Ensure unique seeds across retries and groups
 
-            # [Modified] Unified Guidance Scale (Same as BC)
-            current_img_guidance = 1.5 # Fixed value as requested
-            current_text_guidance = args.text_guidance_scale
-            f_log.write(f">> Strategy: Unified Guidance (Image: {current_img_guidance}, Text: {current_text_guidance})\n")
+                # [DEBUG] Log Seed
+                print(f"DEBUG: Generating Group Member {i} | Seed: {trial_seed} | Query: {variation_query[:50]}...")
+                f_log.write(f"DEBUG: Group {i} Seed: {trial_seed}\n")
 
-            # User Request: Use original_prompt + visual_keywords (refined_prompt)
-            if refined_prompt != prompt:
-                gen_prompt = f"{prompt}. {refined_prompt}. Use reference image <|image_1|>."
-            else:
-                gen_prompt = f"{prompt}. Use reference image <|image_1|>."
+                trial_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_retry{retry_cnt+1}_group{i}.png")
 
-            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
+                imgs_input = [ref_img] if ref_img else []
+                run_omnigen(pipe, prompt, imgs_input, trial_path, trial_seed,
+                            img_guidance_scale=1.5, text_guidance_scale=args.text_guidance_scale)
 
-            current_image = next_path
+                # d. Evaluate
+                trial_diagnosis = taxonomy_aware_diagnosis(prompt, [trial_path], client, args.llm_model, reference_specs=reference_specs)
+                trial_score = trial_diagnosis.get('final_score', 0)
+                trial_critique = trial_diagnosis.get('critique', '')
+
+                group_results.append({
+                    "query": variation_query,
+                    "score": trial_score,
+                    "critique": trial_critique,
+                    "ref_img": ref_img,
+                    "image_path": trial_path
+                })
+
+                f_log.write(f"    Result: Score {trial_score} | Query: {variation_query[:50]}...\n")
+
+            if not group_results:
+                f_log.write(">> Group generation failed completely. Aborting retry.\n")
+                retry_cnt += 1
+                continue
+
+            # C. Analyze Group Results
+            # Find best in group
+            sorted_group = sorted(group_results, key=lambda x: x['score'], reverse=True)
+            best_in_group = sorted_group[0]
+
+            f_log.write(f">> Group Best: Score {best_in_group['score']} (Query: {best_in_group['query']})\n")
+
+            # Update current image to the best of this group
+            current_image = best_in_group['image_path']
+
+            # Learn from the group (Semantic Advantage)
+            new_rule_response = extract_semantic_advantage(group_results, client, args.llm_model)
+            if new_rule_response:
+                if "[GLOBAL]" in new_rule_response:
+                    rule = new_rule_response.replace("[GLOBAL]", "").strip()
+                    experience_lib.add_rule(rule, is_global=True)
+                    f_log.write(f">> Learned New GLOBAL Rule: {rule}\n")
+                    print(f"Learned New GLOBAL Rule: {rule}")
+                elif "[SPECIFIC]" in new_rule_response:
+                    rule = new_rule_response.replace("[SPECIFIC]", "").strip()
+                    experience_lib.add_rule(rule, is_global=False)
+                    f_log.write(f">> Learned New SPECIFIC Rule: {rule}\n")
+                    print(f"Learned New SPECIFIC Rule: {rule}")
+                else:
+                    # Default to specific if no tag
+                    experience_lib.add_rule(new_rule_response, is_global=False)
+                    f_log.write(f">> Learned New Rule (Default Specific): {new_rule_response}\n")
+                    print(f"Learned New Rule: {new_rule_response}")
+
             retry_cnt += 1
 
         # Final Check
         final_success_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_FINAL.png")
         if not os.path.exists(final_success_path):
-            f_log.write(f"\n--- Final Check (Last Generated) ---\n")
+            f_log.write(f"\n--- Final Check ---\n")
+            # Check if the last current_image is better
             if os.path.exists(current_image):
                 diagnosis = taxonomy_aware_diagnosis(prompt, [current_image], client, args.llm_model)
                 score = diagnosis.get('score', 0)
-                f_log.write(f"Final Image Score: {score}\n")
                 if score > best_score:
                     best_score = score
                     best_image_path = current_image
@@ -455,5 +517,13 @@ if __name__ == "__main__":
 
     end_time = time.time()
     elapsed_time = end_time - start_time
+
+    # Stop Monitor & Save Plots
+    monitor.stop()
+    monitor.save_plots(logs_dir)
+
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")

@@ -1,12 +1,8 @@
 '''
-Evaluation Script for Aircraft (All Methods)
+Evaluation Script for Aircraft (TAC + SR)
 =======================================================
 Methods Evaluated:
-  1. Baseline (V1) - Shared
-  2. BC + SR
-  3. BC + MGR
-  4. TAC + SR
-  5. TAC + MGR
+  1. TAC + SR
 
 Metrics:
   - CLIP Score
@@ -26,7 +22,7 @@ import cv2
 # --------------------------------------------------
 # --- 1. Args (Parse BEFORE importing torch) ---
 # --------------------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate Aircraft (All Methods)")
+parser = argparse.ArgumentParser(description="Evaluate Aircraft (TAC + SR)")
 parser.add_argument("--device_id", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
@@ -54,12 +50,6 @@ from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.ssim import MultiScaleStructuralSimilarityIndexMeasure
 
-# [New] Imports for ColQwen3
-try:
-    from transformers import AutoModel, AutoProcessor, AutoConfig
-except ImportError:
-    print("Transformers not found.")
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
@@ -73,11 +63,6 @@ DATASET_CONFIG = {
 }
 
 METHODS = {
-    "BC_noRAG": "results/OmniGenV2_BC_noRAG_Aircraft",
-    "BC_SR": "results/OmniGenV2_BC_SR_Aircraft",
-    "TAC_noRAG": "results/OmniGenV2_TAC_noRAG_Aircraft",
-    "TAC_exp_noRAG": "results/OmniGenV2_TAC_exp_noRAG_Aircraft",
-    "TAC_exp_SR": "results/OmniGenV2_TAC_exp_SR_Aircraft",
     "TAC_SR": "results/OmniGenV2_TAC_SR_Aircraft"
 }
 
@@ -172,19 +157,6 @@ def load_models(device):
     print("Initializing MS-SSIM...")
     models['ms_ssim'] = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     models['ssim_transform'] = T.Compose([T.Resize((256, 256)), T.ToTensor()])
-
-    # 8. ColQwen3
-    print("Loading ColQwen3...")
-    try:
-        # Load model directly
-        models['colqwen3_model'] = AutoModel.from_pretrained(
-            "TomoroAI/tomoro-colqwen3-embed-8b",
-            trust_remote_code=True,
-            dtype="auto"
-        ).to(device).eval()
-        models['colqwen3_processor'] = AutoProcessor.from_pretrained("TomoroAI/tomoro-colqwen3-embed-8b", trust_remote_code=True)
-    except Exception as e:
-        print(f"Error loading ColQwen3: {e}")
 
     return models
 
@@ -357,43 +329,6 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=
             s_feat = F.normalize(s_feat, dim=-1)
             scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
 
-            # ColQwen3 MaxSim
-            if 'colqwen3' in txt_feats and 'colqwen3_model' in models:
-                processor = models['colqwen3_processor']
-                model = models['colqwen3_model']
-
-                # Process Image
-                if hasattr(processor, "process_images"):
-                    batch_images = processor.process_images([img]).to(device)
-                    image_out = model(**batch_images)
-                    if hasattr(image_out, 'embeddings'):
-                        image_emb = image_out.embeddings
-                    elif hasattr(image_out, 'last_hidden_state'):
-                        image_emb = image_out.last_hidden_state
-                    else:
-                        image_emb = image_out
-                else:
-                    inputs = processor(images=img, return_tensors="pt").to(device)
-                    image_out = model(**inputs)
-                    if hasattr(image_out, 'embeddings'):
-                        image_emb = image_out.embeddings
-                    elif hasattr(image_out, 'last_hidden_state'):
-                        image_emb = image_out.last_hidden_state
-                    else:
-                        image_emb = image_out
-
-                # MaxSim
-                Q = txt_feats['colqwen3'].to(device)
-                D = image_emb.to(device)
-
-                # Ensure dtype match
-                D = D.to(Q.dtype)
-
-                sim_matrix = torch.einsum('bqd,bnd->bqn', Q, D)
-                max_sim = sim_matrix.max(dim=-1).values
-                score = max_sim.sum(dim=-1).item()
-                scores['colqwen3_maxsim'] = score
-
     except Exception as e:
         # print(f"Error evaluating {img_path}: {e}")
         return None
@@ -544,15 +479,14 @@ def main():
                     models['kid'][method_name].update(img_tensor, real=False)
                     models['fid'][method_name].update(img_tensor, real=False)
                 except Exception as e:
-                    # print(f"Warning: KID/FID update failed for {method_name} (fake): {e}")
                     pass
 
     # Report
     print("\n" + "="*120)
-    print(f"  EVAL REPORT: Aircraft (All Methods)")
+    print(f"  EVAL REPORT: Aircraft (TAC + SR)")
     print("="*120)
 
-    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8} | {'MS-SSIM':<8} | {'MaxSim':<8}")
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8} | {'MS-SSIM':<8}")
     print("-" * 120)
 
     for method_name in METHODS.keys():
@@ -574,14 +508,13 @@ def main():
         clip_s = np.mean([x['clip'] for x in lst])
         siglip_s = np.mean([x['siglip'] for x in lst])
         d3 = np.mean([x['dinov3_base'] for x in lst])
-        cq3 = np.mean([x.get('colqwen3_maxsim', 0) for x in lst])
         lap_var = np.mean([x.get('laplacian_var', 0) for x in lst])
 
         # MS-SSIM (Filter None)
         ssim_vals = [x.get('ms_ssim') for x in lst if x.get('ms_ssim') is not None]
         ms_ssim = np.mean(ssim_vals) if ssim_vals else 0.0
 
-        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}    | {ms_ssim:.4f}   | {cq3:.4f}")
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}    | {ms_ssim:.4f}")
 
     print("="*120)
 

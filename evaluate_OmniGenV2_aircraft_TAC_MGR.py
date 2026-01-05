@@ -9,11 +9,15 @@ Metrics:
   - SigLIP Score
   - DINO v1/v2/v3 (Image Fidelity)
   - KID (Kernel Inception Distance)
+  - FID (Frechet Inception Distance)
+  - Laplacian Variance (Blurriness)
+  - Pairwise MS-SSIM (Diversity within generated group - if applicable)
 '''
 
 import os
 import sys
 import argparse
+import cv2
 
 # --------------------------------------------------
 # --- 1. Args (Parse BEFORE importing torch) ---
@@ -34,6 +38,7 @@ import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from collections import defaultdict
+import glob
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +47,8 @@ import torchvision.transforms as T
 import open_clip
 from open_clip import create_model_from_pretrained, get_tokenizer
 from torchmetrics.image.kid import KernelInceptionDistance
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.ssim import MultiScaleStructuralSimilarityIndexMeasure
 
 # [New] Imports for ColQwen3
 try:
@@ -141,16 +148,23 @@ def load_models(device):
     models['siglip_model'] = models['siglip_model'].eval().to(device)
     models['siglip_tokenizer'] = get_tokenizer(sig_name)
 
-    # 6. KID (One per method)
-    print("Initializing KID...")
+    # 6. KID & FID (One per method)
+    print("Initializing KID & FID...")
     models['kid'] = {}
+    models['fid'] = {}
     for m in METHODS.keys():
         # Reduced subset_size to 5 to allow calculation with fewer samples
         models['kid'][m] = KernelInceptionDistance(subset_size=5, normalize=True).to(device)
+        models['fid'][m] = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
 
     models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
 
-    # 7. ColQwen3
+    # 7. MS-SSIM
+    print("Initializing MS-SSIM...")
+    models['ms_ssim'] = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    models['ssim_transform'] = T.Compose([T.Resize((256, 256)), T.ToTensor()])
+
+    # 8. ColQwen3
     print("Loading ColQwen3...")
     try:
         # Load model directly
@@ -205,27 +219,61 @@ def get_best_image_path(method_name, dir_path, safe_filename_prefix):
     # Try to find FINAL, if not, fallback to highest V number
     final_path = os.path.join(dir_path, f"{safe_filename_prefix}_FINAL.png")
     if os.path.exists(final_path):
-        img_path = final_path
-    else:
-        # Fallback logic: Find highest V number (up to V10)
-        best_v_path = None
-        for i in range(10, 1, -1): # Check V10 down to V2
-            p = os.path.join(dir_path, f"{safe_filename_prefix}_V{i}.png")
-            if os.path.exists(p):
-                best_v_path = p
-                break
+        return final_path
 
-        # If no V2-V10, check V1
-        if not best_v_path:
-            v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
-            if os.path.exists(v1_p):
-                best_v_path = v1_p
+    # Fallback logic: Find highest V number (up to V10)
+    best_v_path = None
+    for i in range(10, 1, -1): # Check V10 down to V2
+        p = os.path.join(dir_path, f"{safe_filename_prefix}_V{i}.png")
+        if os.path.exists(p):
+            best_v_path = p
+            break
 
-        img_path = best_v_path
+    # If no V2-V10, check V1
+    if not best_v_path:
+        v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+        if os.path.exists(v1_p):
+            best_v_path = v1_p
 
-    if img_path and os.path.exists(img_path):
-        return img_path
+    if best_v_path and os.path.exists(best_v_path):
+        return best_v_path
     return None
+
+def get_group_images(dir_path, safe_filename_prefix):
+    """
+    Find all group images for the latest retry.
+    Pattern: {safe_filename_prefix}_retry{N}_group{M}.png
+    """
+    # Find max retry
+    max_retry = -1
+    pattern = os.path.join(dir_path, f"{safe_filename_prefix}_retry*_group*.png")
+    files = glob.glob(pattern)
+
+    if not files:
+        return []
+
+    for f in files:
+        try:
+            # Extract retry number
+            base = os.path.basename(f)
+            parts = base.split('_retry')
+            if len(parts) > 1:
+                retry_part = parts[1].split('_group')[0]
+                retry_num = int(retry_part)
+                if retry_num > max_retry:
+                    max_retry = retry_num
+        except: pass
+
+    if max_retry == -1:
+        return []
+
+    # Collect all images for max_retry
+    group_images = []
+    target_pattern = os.path.join(dir_path, f"{safe_filename_prefix}_retry{max_retry}_group*.png")
+    for f in glob.glob(target_pattern):
+        group_images.append(f)
+
+    return group_images
 
 def get_dino_features_batch(paths, model, transform, device, batch_size=32):
     feats = []
@@ -244,10 +292,42 @@ def get_dino_features_batch(paths, model, transform, device, batch_size=32):
     if not feats: return None
     return F.normalize(torch.cat(feats, dim=0), dim=-1)
 
+def calculate_laplacian_variance(img_path):
+    try:
+        img = cv2.imread(img_path)
+        if img is None: return 0.0
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+    except Exception as e:
+        # print(f"Error calculating Laplacian Variance: {e}")
+        return 0.0
+
+def calculate_pairwise_ms_ssim(img_paths, model, transform, device):
+    if len(img_paths) < 2:
+        return None
+    
+    # Randomly pick 2
+    pair = random.sample(img_paths, 2)
+    
+    try:
+        img1 = transform(Image.open(pair[0]).convert("RGB")).unsqueeze(0).to(device)
+        img2 = transform(Image.open(pair[1]).convert("RGB")).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            score = model(img1, img2)
+        return score.item()
+    except Exception as e:
+        # print(f"Error calculating MS-SSIM: {e}")
+        return None
+
 def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=None):
     scores = {}
     try:
         img = Image.open(img_path).convert("RGB")
+        
+        # Laplacian Variance
+        scores['laplacian_var'] = calculate_laplacian_variance(img_path)
+
         with torch.no_grad():
             # DINO
             dino_in = models['dino_transform'](img).unsqueeze(0).to(device)
@@ -414,7 +494,7 @@ def main():
                 except Exception as e:
                     print(f"Error encoding text for ColQwen3: {e}")
 
-        # 3. Update KID (Real) - Update ALL KID models with real data
+        # 3. Update KID & FID (Real) - Update ALL KID/FID models with real data
         kp = random.sample(real_paths, min(len(real_paths), 20))
         kimgs = []
         for p in kp:
@@ -423,11 +503,13 @@ def main():
 
         if kimgs:
             kt = torch.stack(kimgs).to(device)
+            
             for m in METHODS.keys():
                 try:
                     models['kid'][m].update(kt, real=True)
+                    models['fid'][m].update(kt, real=True)
                 except Exception as e:
-                    print(f"Warning: KID update failed for {m} (real): {e}")
+                    print(f"Warning: KID/FID update failed for {m} (real): {e}")
 
         # 4. Evaluate Each Method
         for method_name, dir_path in METHODS.items():
@@ -436,26 +518,33 @@ def main():
             if not img_path:
                 continue
 
-            # Eval
+            # Eval Single Image Metrics
             res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+            
+            # Eval Pairwise MS-SSIM (Diversity)
+            # Find group images
+            group_imgs = get_group_images(dir_path, task['safe_filename_prefix'])
+            ms_ssim_val = calculate_pairwise_ms_ssim(group_imgs, models['ms_ssim'], models['ssim_transform'], device)
+            if ms_ssim_val is not None:
+                res['ms_ssim'] = ms_ssim_val
+
             if res:
                 results[method_name].append(res)
                 try:
-                    models['kid'][method_name].update(
-                        models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device),
-                        real=False
-                    )
+                    img_tensor = models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
+                    models['kid'][method_name].update(img_tensor, real=False)
+                    models['fid'][method_name].update(img_tensor, real=False)
                 except Exception as e:
-                    # print(f"Warning: KID update failed for {method_name} (fake): {e}")
+                    # print(f"Warning: KID/FID update failed for {method_name} (fake): {e}")
                     pass
 
     # Report
-    print("\n" + "="*80)
+    print("\n" + "="*120)
     print(f"  EVAL REPORT: Aircraft (TAC + MGR Only)")
-    print("="*80)
+    print("="*120)
 
-    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv1':<8} | {'DINOv2':<8} | {'DINOv3':<8} | {'KID':<8} | {'MaxSim':<8}")
-    print("-" * 80)
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8} | {'MS-SSIM':<8} | {'MaxSim':<8}")
+    print("-" * 120)
 
     for method_name in METHODS.keys():
         lst = results[method_name]
@@ -463,23 +552,29 @@ def main():
             print(f"{method_name:<15} | N/A")
             continue
 
-        # Compute KID
+        # Compute KID & FID
         try:
             kid_score, _ = models['kid'][method_name].compute()
             kid_val = kid_score.item()
-        except:
-            kid_val = 0.0
+        except: kid_val = 0.0
+        
+        try:
+            fid_val = models['fid'][method_name].compute().item()
+        except: fid_val = 0.0
 
         clip_s = np.mean([x['clip'] for x in lst])
         siglip_s = np.mean([x['siglip'] for x in lst])
-        d1 = np.mean([x['dinov1_base'] for x in lst])
-        d2 = np.mean([x['dinov2_base'] for x in lst])
         d3 = np.mean([x['dinov3_base'] for x in lst])
         cq3 = np.mean([x.get('colqwen3_maxsim', 0) for x in lst])
+        lap_var = np.mean([x.get('laplacian_var', 0) for x in lst])
+        
+        # MS-SSIM (Filter None)
+        ssim_vals = [x.get('ms_ssim') for x in lst if x.get('ms_ssim') is not None]
+        ms_ssim = np.mean(ssim_vals) if ssim_vals else 0.0
 
-        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d1:.4f}   | {d2:.4f}   | {d3:.4f}   | {kid_val:.5f} | {cq3:.4f}")
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}    | {ms_ssim:.4f}   | {cq3:.4f}")
 
-    print("="*80)
+    print("="*120)
 
 if __name__ == "__main__":
     main()

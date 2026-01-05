@@ -298,3 +298,68 @@ def taxonomy_aware_diagnosis(prompt, image_paths, gpt_client, model, reference_s
             "needed_modifications": [prompt]
         }
 
+def rate_image_match(image_path, class_name, specs, client, model):
+    """
+    Rates how well an image matches the visual description of a class.
+    """
+    if not image_path or not os.path.exists(image_path): return 0
+
+    prompt = f"""
+    Task: Rate how well this image matches the visual description of a "{class_name}".
+    Specs: {specs}
+
+    Criteria:
+    - 10: Perfect match, clear view.
+    - 5: Likely correct type, but blurry/occluded.
+    - 0: Wrong object, wrong type, or extremely low quality.
+
+    Output ONLY a single integer score (0-10).
+    """
+
+    try:
+        response = message_gpt(prompt, client, image_paths=[image_path], model=model, temperature=0.1)
+        match = re.search(r'\d+', response)
+        return int(match.group()) if match else 5
+    except Exception as e:
+        print(f"Error in rating: {e}")
+        return 5
+
+def extract_semantic_advantage(results, client, model):
+    """
+    Extracts the key semantic advantage/concept from a set of results (Best vs Worst).
+    """
+    # Sort by score descending
+    sorted_res = sorted(results, key=lambda x: x['score'], reverse=True)
+    best = sorted_res[0]
+    worst = sorted_res[-1]
+
+    # If scores are too close, skip
+    if best['score'] - worst['score'] < 1.0:
+        return None
+
+    msg = f"""
+    You are analyzing a Retrieval-Augmented Generation system for Aircraft.
+
+    **Contrast Analysis:**
+    1. **The FAILED Attempt (Score {worst['score']}):**
+       - Critique: "{worst['critique']}"
+       - What specific visual detail misled the model? (e.g., "Reference image had high-bypass turbofan engines", "Wrong fuselage length")
+
+    2. **The BETTER Attempt (Score {best['score']}):**
+       - Critique: "{best['critique']}"
+       - Did it fix the specific error identified above?
+
+    **Actionable Insight:**
+    Extract a rule to improve future attempts. Decide if this rule is:
+    - **[GLOBAL]**: Applies to generating ANY image with this model (e.g., "Don't use negative words", "Describe lighting").
+    - **[SPECIFIC]**: Applies ONLY to this specific object type (e.g., "Must have 4 engines", "Beak must be yellow").
+
+    **Output Format:**
+    [TAG] The rule text.
+
+    Example:
+    [SPECIFIC] The fuselage must not have a hump.
+    [GLOBAL] Always describe the background to prevent white-space artifacts.
+    """
+    return message_gpt(msg, client, model=model, temperature=0.7)
+

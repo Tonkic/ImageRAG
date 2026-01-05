@@ -1,14 +1,14 @@
 '''
-OmniGenV2_BC_SR_Aircraft.py
+OmniGenV2_BC_noRAG_Aircraft.py
 =============================
 Configuration:
   - Generator: OmniGen V2
   - Critic: Binary Critic (BC) -> Simple Success/Fail
-  - Retrieval: Static Retrieval (SR) -> Top-1, No Memory
+  - Retrieval: None (noRAG) -> Rejection Sampling / Retry with different seed
   - Dataset: FGVC-Aircraft
 
 Usage:
-  python OmniGenV2_BC_SR_Aircraft.py \
+  python OmniGenV2_BC_noRAG_Aircraft.py \
       --device_id 0 \
       --task_index 0 \
       --total_chunks 1 \
@@ -27,7 +27,7 @@ os.environ.pop("https_proxy", None)
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # --- 1. Argument Parsing ---
-parser = argparse.ArgumentParser(description="OmniGenV2 + BC + SR (Aircraft)")
+parser = argparse.ArgumentParser(description="OmniGenV2 + BC + noRAG (Aircraft)")
 
 parser.add_argument("--device_id", type=str, required=True, help="Main device ID (e.g. '0' or '0,1')")
 parser.add_argument("--vlm_device_id", type=str, default=None, help="Device ID for VLM (if different)")
@@ -48,9 +48,8 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
 parser.add_argument("--text_guidance_scale", type=float, default=7.5)
 parser.add_argument("--image_guidance_scale", type=float, default=1.5)
-parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft")
+parser.add_argument("--embeddings_path", type=str, default="datasets/embeddings/aircraft") # Not used but kept for compat
 parser.add_argument("--retrieval_method", type=str, default="CLIP", choices=["CLIP", "LongCLIP", "SigLIP", "SigLIP2", "ColPali", "Qwen2.5-VL", "Qwen3-VL"], help="Retrieval Model")
-parser.add_argument("--retrieval_datasets", nargs='+', default=['aircraft'], choices=['aircraft', 'cub', 'imagenet'], help="Datasets to use for retrieval")
 
 args = parser.parse_args()
 
@@ -78,9 +77,8 @@ import openai
 import clip
 
 # ------------------------------------------------------------------
-# [IMPORTS] BC + SR
+# [IMPORTS] BC + noRAG
 from binary_critic import retrieval_caption_generation  # Binary Critic
-from memory_guided_retrieval import retrieve_img_per_caption   # Static Retrieval
 from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient
 # ------------------------------------------------------------------
 
@@ -97,7 +95,7 @@ DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_BC_SR_Aircraft"
+    "output_path": "results/OmniGenV2_BC_noRAG_Aircraft"
 }
 
 def setup_system(omnigen_device, vlm_device_map):
@@ -145,71 +143,6 @@ def setup_system(omnigen_device, vlm_device_map):
     client = UsageTrackingClient(client)
     return pipe, client
 
-def load_retrieval_db():
-    print(f"Loading Retrieval DBs: {args.retrieval_datasets}...")
-    all_paths = []
-
-    for ds in args.retrieval_datasets:
-        if ds == 'aircraft':
-            print("  Loading Aircraft...")
-            root = "datasets/fgvc-aircraft-2013b/data/images"
-            list_file = "datasets/fgvc-aircraft-2013b/data/images_train.txt"
-            if os.path.exists(list_file):
-                with open(list_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line: continue
-                        path = os.path.join(root, f"{line}.jpg")
-                        if os.path.exists(path):
-                            all_paths.append(path)
-            else:
-                print(f"  Warning: Aircraft list file not found at {list_file}")
-
-        elif ds == 'cub':
-            print("  Loading CUB...")
-            root = "datasets/CUB_200_2011/images"
-            split_file = "datasets/CUB_200_2011/train_test_split.txt"
-            images_file = "datasets/CUB_200_2011/images.txt"
-
-            if os.path.exists(split_file) and os.path.exists(images_file):
-                train_ids = set()
-                with open(split_file, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 2 and parts[1] == '1':
-                            train_ids.add(parts[0])
-
-                with open(images_file, 'r') as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            img_id = parts[0]
-                            rel_path = parts[1]
-                            if img_id in train_ids:
-                                path = os.path.join(root, rel_path)
-                                if os.path.exists(path):
-                                    all_paths.append(path)
-            else:
-                print(f"  Warning: CUB files not found at {split_file} or {images_file}")
-
-        elif ds == 'imagenet':
-            print("  Loading ImageNet...")
-            root = "/home/tingyu/imageRAG/datasets/ILSVRC2012_train"
-            list_file = "/home/tingyu/imageRAG/datasets/imagenet_train_list.txt"
-            if os.path.exists(list_file):
-                with open(list_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line: continue
-                        path = os.path.join(root, line)
-                        if os.path.exists(path):
-                            all_paths.append(path)
-            else:
-                print(f"  Warning: ImageNet list file not found at {list_file}")
-
-    print(f"Total loaded retrieval images: {len(all_paths)}")
-    return all_paths
-
 def run_omnigen(pipe, prompt, input_images, output_path, seed):
     if isinstance(input_images, str):
         input_images = [input_images]
@@ -242,7 +175,6 @@ if __name__ == "__main__":
 
     seed_everything(args.seed)
     pipe, client = setup_system(omnigen_device, vlm_device_map)
-    retrieval_db = load_retrieval_db()
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     # Create logs directory
@@ -297,7 +229,7 @@ if __name__ == "__main__":
         current_image = v1_path
         retry_cnt = 0
 
-        # Loop (Static Retrieval = No Exclusion List)
+        # Loop (noRAG = Rejection Sampling)
         while retry_cnt < args.max_retries:
             f_log.write(f"\n--- Retry {retry_cnt+1} ---\n")
 
@@ -316,33 +248,14 @@ if __name__ == "__main__":
                 shutil.copy(current_image, final_success_path)
                 break
 
-            # 2. Retrieval (Static)
-            # Always retrieve Top-1 based on the original prompt
-            # (Since BC doesn't give us fine-grained features to augment the query)
-
-            # [Token Length Check]
-            if args.retrieval_method not in ["Qwen2.5-VL", "Qwen3-VL"]:
-                from memory_guided_retrieval import check_token_length
-                check_token_length([prompt], device="cpu", method=args.retrieval_method)
-
-            retrieved_lists, _ = retrieve_img_per_caption(
-                [prompt], retrieval_db,
-                embeddings_path=args.embeddings_path,
-                k=1, device="cuda", method=args.retrieval_method
-            )
-
-            if not retrieved_lists[0]:
-                f_log.write(">> Retrieval failed.\n")
-                break
-
-            best_ref = retrieved_lists[0][0]
-            f_log.write(f">> Static Ref: {best_ref}\n")
+            # 2. No Retrieval - Just Retry with new seed
+            f_log.write(">> No Retrieval (noRAG). Retrying with new seed.\n")
 
             # 3. Generation
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
-            regen_prompt = f"{prompt}. Use reference image <|image_1|>."
+            regen_prompt = prompt # No change in prompt
 
-            run_omnigen(pipe, regen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1)
+            run_omnigen(pipe, regen_prompt, [], next_path, args.seed + retry_cnt + 1)
 
             current_image = next_path
             retry_cnt += 1

@@ -69,30 +69,13 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
     if isinstance(prompts, str):
         prompts = [prompts]
 
-    # [Modified] Long Text Handling: Chunk & Average
+    # [Modified] Long Text Handling: Truncate (Removed Mean Pool)
     text_features_list = []
     with torch.no_grad():
         for p in prompts:
-            try:
-                # Try full text first (truncate=False to detect overflow)
-                text = clip.tokenize([p], truncate=False).to(device)
-                feat = model.encode_text(text)
-            except RuntimeError:
-                # If too long, chunk by words
-                words = p.split()
-                chunks = []
-                chunk_size = 50 # Safe margin for 77 token limit
-                for i in range(0, len(words), chunk_size):
-                    chunk = " ".join(words[i:i+chunk_size])
-                    chunks.append(chunk)
-
-                if not chunks: chunks = [""]
-
-                # Encode chunks and average
-                text_chunks = clip.tokenize(chunks, truncate=True).to(device)
-                chunk_feats = model.encode_text(text_chunks) # [N, 512]
-                feat = chunk_feats.mean(dim=0, keepdim=True) # [1, 512]
-
+            # Simply truncate if too long
+            text = clip.tokenize([p], truncate=True).to(device)
+            feat = model.encode_text(text)
             text_features_list.append(feat)
 
         text_features = torch.cat(text_features_list, dim=0)
