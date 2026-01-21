@@ -20,6 +20,7 @@ models/
 output/
 Qwen3-VL-4B-Instruct/
 
+
 # 大型数据集和文件
 datasets/
 results/
@@ -34,3 +35,7 @@ nohup.out
 # 旧版本代码
 oldcode/
 temp/
+
+#pt文件
+pic2word_longclip_*.pt
+pic2word_mapper_*.pt

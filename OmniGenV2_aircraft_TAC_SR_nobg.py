@@ -21,6 +21,7 @@ from datetime import datetime
 import argparse
 import sys
 import os
+import torchvision.transforms as transforms
 # [Proxy Config] Clear system proxies for direct connection
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
@@ -45,6 +46,7 @@ parser.add_argument("--openai_api_key", type=str, required=False, help="Required
 parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # SiliconFlow Default
 
 # Local Weights Config
+parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
 parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
 parser.add_argument("--enable_offload", action="store_true", help="Enable CPU offloading for OmniGen to save VRAM")
 parser.add_argument("--enable_teacache", action="store_true", help="Enable TeaCache acceleration")
@@ -62,6 +64,7 @@ parser.add_argument("--use_hybrid_retrieval", action="store_true", help="Enable 
 parser.add_argument("--enable_pic2word", action="store_true", help="Enable Pic2Word Composed Retrieval (requires previous image)")
 parser.add_argument("--pic2word_checkpoint", type=str, default="pic2word_mapper_ep9.pt", help="Path to Pic2Word Mapper checkpoint")
 parser.add_argument("--adapter_path", type=str, default=None, help="Path to LoRA adapter (for Qwen2.5-VL)")
+parser.add_argument("--birefnet_model_path", type=str, default="ZhengPeng7/BiRefNet", help="Path or HF ID for BiRefNet")
 parser.add_argument("--retrieval_datasets", nargs='+', default=['aircraft'], choices=['aircraft', 'cub', 'imagenet'], help="Datasets to use for retrieval")
 
 args = parser.parse_args()
@@ -99,6 +102,89 @@ import clip
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # The new Critic
 from memory_guided_retrieval import retrieve_img_per_caption, retrieve_composed  # The Static Retrieval logic + Composed
 from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient, ResourceMonitor, RUN_STATS
+
+# --- BiRefNet Utilities ---
+GLOBAL_BIREFNET = None
+def load_birefnet(model_path, device):
+    global GLOBAL_BIREFNET
+    if GLOBAL_BIREFNET is None:
+        print(f"Loading BiRefNet from {model_path} (Manual Load)...")
+        try:
+            from transformers import AutoConfig
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+            from huggingface_hub import hf_hub_download
+
+            # [Fix 5.0] Manual instantiation to bypass Accelerate's Meta Tensor initialization
+
+            # 1. Load Config & Class
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            model_class = get_class_from_dynamic_module(
+                config.auto_map["AutoModelForImageSegmentation"],
+                model_path
+            )
+
+            # 2. Instantiate on CPU
+            model = model_class(config)
+
+            # 3. Load Weights
+            weight_path = None
+            state_dict = None
+            try:
+                # Try safetensors
+                weight_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
+                from safetensors.torch import load_file
+                state_dict = load_file(weight_path)
+            except Exception:
+                try:
+                    # Fallback to pytorch_model.bin
+                    weight_path = hf_hub_download(repo_id=model_path, filename="pytorch_model.bin")
+                    state_dict = torch.load(weight_path, map_location="cpu")
+                except Exception as e_load:
+                    print(f"Could not find weights for BiRefNet: {e_load}")
+                    raise e_load
+
+            # 4. Apply Weights
+            msg = model.load_state_dict(state_dict, strict=False) # strict=False to be safe with version mismatches
+            print(f"BiRefNet Weights loaded: {msg}")
+
+            # 5. Move to Device
+            GLOBAL_BIREFNET = model
+            GLOBAL_BIREFNET.to(device)
+            GLOBAL_BIREFNET.eval()
+
+        except Exception as e:
+            print(f"Error loading BiRefNet: {e}")
+            import traceback
+            traceback.print_exc()
+            GLOBAL_BIREFNET = None
+    return GLOBAL_BIREFNET
+
+def remove_background(image, model, device):
+    # Prepare Input
+    w, h = image.size
+    transform_image = transforms.Compose([
+        transforms.Resize((1024, 1024)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    input_images = transform_image(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        preds = model(input_images)[-1].sigmoid().cpu()
+
+    pred = preds[0].squeeze()
+    pred_pil = transforms.ToPILImage()(pred)
+    mask = pred_pil.resize((w, h))
+
+    # Apply Mask
+    out_img = image.copy()
+    out_img.putalpha(mask)
+
+    # Composite on White Background
+    final_image = Image.new("RGB", image.size, (255, 255, 255))
+    final_image.paste(out_img, (0, 0), out_img)
+
+    return final_image
 
 def seed_everything(seed):
     random.seed(seed)
@@ -585,6 +671,58 @@ if __name__ == "__main__":
 
             f_log.write(f">> Static Ref: {best_ref} (Score: {best_ref_score:.4f})\n")
 
+            # [BiRefNet Background Removal]
+            ref_input = best_ref
+            nobg_cache_dir = "datasets/nobg_cache"
+            os.makedirs(nobg_cache_dir, exist_ok=True)
+
+            if best_ref:
+                try:
+                    # 1. Determine Cache Path
+                    cache_path = None
+                    if isinstance(best_ref, str):
+                        # Use filename as unique key (e.g., 1047583.png)
+                        clean_name = os.path.basename(best_ref).rsplit('.', 1)[0]
+                        cache_path = os.path.join(nobg_cache_dir, f"{clean_name}.png")
+
+                    # 2. Check Cache
+                    if cache_path and os.path.exists(cache_path):
+                        f_log.write(f">> BiRefNet: Using Cached No-BG Image: {cache_path}\n")
+                        print(f"BiRefNet: Hit Cache -> {cache_path}")
+                        ref_input = Image.open(cache_path) # Load from cache
+                    else:
+                        # 3. Process with BiRefNet (Only if not cached)
+                        # Load BiRefNet (Lazy Load on first use)
+                        bg_device = retrieval_device if retrieval_device != "cpu" else "cuda"
+                        birefnet = load_birefnet(args.birefnet_model_path, bg_device)
+
+                        if birefnet:
+                            if isinstance(best_ref, str):
+                                ref_img_pil = Image.open(best_ref).convert("RGB")
+                            else:
+                                # It's already a PIL Image
+                                ref_img_pil = best_ref.convert("RGB")
+
+                            f_log.write(f">> Removing background using BiRefNet...\n")
+                            ref_img_nobg = remove_background(ref_img_pil, birefnet, bg_device)
+
+                            # 4. Save to Cache
+                            if cache_path:
+                                try:
+                                    ref_img_nobg.save(cache_path)
+                                    f_log.write(f">> BiRefNet: Cached result to {cache_path}\n")
+                                except Exception as e_save:
+                                    f_log.write(f">> BiRefNet Cache Save Error: {e_save}\n")
+
+                            ref_input = ref_img_nobg
+
+                        # Optional: Save nobg image for debug (current run context)
+                        nobg_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}_ref_nobg.png")
+                        if isinstance(ref_input, Image.Image):
+                            ref_input.save(nobg_path)
+                except Exception as e_bg:
+                    f_log.write(f">> BiRefNet Error: {e_bg}\n")
+
             # C. Generation Strategy
             next_path = os.path.join(DATASET_CONFIG['output_path'], f"{safe_name}_V{retry_cnt+2}.png")
 
@@ -601,7 +739,7 @@ if __name__ == "__main__":
             else:
                 gen_prompt = f"{prompt}. Use reference image <|image_1|>."
 
-            run_omnigen(pipe, gen_prompt, [best_ref], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
+            run_omnigen(pipe, gen_prompt, [ref_input], next_path, args.seed + retry_cnt + 1, img_guidance_scale=current_img_guidance, text_guidance_scale=current_text_guidance)
 
             current_image = next_path
             retry_cnt += 1

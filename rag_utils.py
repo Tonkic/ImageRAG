@@ -142,18 +142,34 @@ class ExperienceLibrary:
 
 # --- Local Qwen3-VL Wrapper ---
 class LocalQwen3VLWrapper:
-    def __init__(self, model_path, device_map="auto"):
+    def __init__(self, model_path, device_map="auto", shared_model=None, shared_processor=None):
         from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
         import torch
 
-        print(f"Loading local Qwen3-VL from {model_path} with device_map={device_map}...")
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path,
-            dtype="auto",
-            device_map=device_map,
-            trust_remote_code=True
-        )
-        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        if shared_model is not None and shared_processor is not None:
+             print(f"Loading LocalQwen3VLWrapper with SHARED model...")
+             self.model = shared_model
+             self.processor = shared_processor
+        else:
+             # Check if model is already loaded in global scope to avoid reloading
+             import sys
+             already_loaded_model = getattr(sys.modules.get("__main__"), "GLOBAL_QWEN_MODEL", None)
+             already_loaded_processor = getattr(sys.modules.get("__main__"), "GLOBAL_QWEN_PROCESSOR", None)
+
+             if already_loaded_model is not None and already_loaded_processor is not None:
+                  print(f"Reuse GLOBAL_QWEN_MODEL from main module...")
+                  self.model = already_loaded_model
+                  self.processor = already_loaded_processor
+             else:
+                print(f"Loading local Qwen3-VL from {model_path} with device_map={device_map}...")
+                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_path,
+                    dtype="auto",
+                    device_map=device_map,
+                    trust_remote_code=True
+                )
+                self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
         self.chat = self.Chat(self)
 
     class Chat:

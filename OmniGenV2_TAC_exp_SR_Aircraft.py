@@ -16,26 +16,12 @@ Usage:
       --omnigen2_path ./OmniGen2 \
       --openai_api_key "sk-..."
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
 import os
-import json
-import shutil
-import numpy as np
-import torch
-import random
-from PIL import Image
-from tqdm import tqdm
-import openai
-import clip
-import time
-import base64
-import io
-import psutil
-import threading
-import matplotlib.pyplot as plt
-import datetime
 
 # [Proxy Config] Clear system proxies for direct connection
 os.environ.pop("HTTP_PROXY", None)
@@ -63,6 +49,7 @@ parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Inst
 # Local Weights Config
 parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
 parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
+parser.add_argument("--enable_offload", action="store_true", help="Enable CPU offloading for OmniGen to save VRAM")
 
 # Params
 parser.add_argument("--seed", type=int, default=0)
@@ -90,6 +77,24 @@ else:
     retrieval_device = "cuda:0"
 
 print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import json
+import shutil
+import numpy as np
+import torch
+import random
+from PIL import Image
+from tqdm import tqdm
+import openai
+import clip
+import time
+import base64
+import io
+import psutil
+import threading
+import matplotlib.pyplot as plt
+import datetime
+
 print(f"DEBUG: OmniGen Device: {omnigen_device}, VLM Device Map: {vlm_device_map}, Retrieval Device: {retrieval_device}")
 print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices.")
 
@@ -115,11 +120,20 @@ from rag_utils import (
 # RUN_STATS is imported from rag_utils
 
 # --- 2. Config ---
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_exp_SR_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_TAC_exp_SR_Aircraft_{run_time}"
 }
 
 # --- Experience Library ---
@@ -143,7 +157,11 @@ def setup_system(omnigen_device, vlm_device_map):
             pipe.transformer.enable_teacache = False
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-        pipe.to(omnigen_device)
+        if args.enable_offload:
+            print("Enabling model CPU offload for OmniGen...")
+            pipe.enable_model_cpu_offload(device=omnigen_device)
+        else:
+            pipe.to(omnigen_device)
     except ImportError as e:
         print(f"Error: OmniGen2 not found. Details: {e}")
         import traceback
@@ -151,8 +169,8 @@ def setup_system(omnigen_device, vlm_device_map):
         sys.exit(1)
 
     print("Initializing Client...")
-    # Logic: Explicit Local Flag OR Missing API Key -> Use Local Weights
-    if args.use_local_model_weight or not args.openai_api_key:
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
         print(f"  Using Local Model Weights from {args.local_model_weight_path}")
         client = LocalQwen3VLWrapper(args.local_model_weight_path, device_map=vlm_device_map)
         # Override llm_model arg to avoid confusion, though wrapper ignores it
@@ -396,7 +414,7 @@ if __name__ == "__main__":
                 # a. Generate Query Variation
                 # Use high temperature for diversity
                 variation_query = message_gpt(instruction, client, model=args.llm_model, temperature=0.9)
-                if not variation_query: variation_query = f"{class_name} {class_name}"
+                if not variation_query: variation_query = f"{class_name}"
 
                 # Clean up query (remove quotes etc if any)
                 variation_query = variation_query.replace('"', '').replace("'", "").strip()

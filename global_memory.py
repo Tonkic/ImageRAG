@@ -68,7 +68,7 @@ class MemoryProjector(nn.Module):
         return self.score_head(combined)
 
 class GlobalMemory:
-    def __init__(self, memory_file="global_memory.json", model_path="global_memory_model.pth", device="cuda", embedding_model="colqwen2.5", adapter_path=None):
+    def __init__(self, memory_file="global_memory.json", model_path="global_memory_model.pth", device="cuda", embedding_model="Qwen3-VL", adapter_path=None, external_model=None, external_processor=None):
         self.memory_file = memory_file
         self.model_path = model_path
         self.device = device
@@ -81,9 +81,9 @@ class GlobalMemory:
         # 初始化 Taboo Search 的历史记录
         self.history = set()
 
-        # [懒加载] 不立即加载模型以节省 VRAM
-        self.model = None
-        self.processor = None
+        # [Optim] 支持外部共享模型
+        self.model = external_model
+        self.processor = external_processor
 
         # Projector 将在模型加载且维度已知后初始化
         self.projector = None
@@ -91,11 +91,36 @@ class GlobalMemory:
         # 默认模型名称
         self.qwen_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
 
-        print(f"初始化新的全局记忆模型 (仅内存)。Embedding: {self.embedding_model_type}")
+        print(f"初始化新的全局记忆模型. External Model Provided: {self.model is not None}")
+
+    def _init_projector_if_needed(self):
+         """Helper to init projector if model is ready"""
+         if self.projector is None and self.model is not None:
+            # 自动探测维度
+            hidden_size = 3584 # Default Qwen2.5-VL
+
+            try:
+                # 尝试从 config 获取
+                if hasattr(self.model, "config"):
+                    hidden_size = self.model.config.hidden_size
+                elif hasattr(self.model, "module") and hasattr(self.model.module, "config"):
+                     hidden_size = self.model.module.config.hidden_size
+            except: pass
+
+            print(f"初始化 MemoryProjector (Input Dim: {hidden_size})...")
+            self.projector = MemoryProjector(input_dim=hidden_size, hidden_dim=512).to(self.device)
+
+            if os.path.exists(self.model_path):
+                print(f"加载 Projector 权重: {self.model_path}")
+                try:
+                    self.projector.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                except Exception as e:
+                    print(f"加载 Projector 权重失败: {e}")
 
     def _load_model(self):
         """加载指定的 Embedding 模型 (Qwen2.5-VL 或 Qwen3-VL)"""
         if self.model is not None:
+            self._init_projector_if_needed()
             return
 
         model_name_or_path = ""
@@ -119,6 +144,9 @@ class GlobalMemory:
                 device_map=self.device,
                 trust_remote_code=True
             ).eval()
+
+            # Init projector after loading
+            self._init_projector_if_needed()
 
             if self.adapter_path:
                 try:

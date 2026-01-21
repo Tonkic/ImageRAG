@@ -15,6 +15,8 @@ Usage:
       --omnigen2_path ./OmniGen2 \
       --openai_api_key "sk-..."
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
@@ -79,7 +81,7 @@ import clip
 # ------------------------------------------------------------------
 # [IMPORTS] BC + noRAG
 from binary_critic import retrieval_caption_generation  # Binary Critic
-from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient
+from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient, ResourceMonitor, RUN_STATS
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -91,11 +93,20 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_BC_noRAG_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_BC_noRAG_Aircraft_{run_time}"
 }
 
 def setup_system(omnigen_device, vlm_device_map):
@@ -126,8 +137,8 @@ def setup_system(omnigen_device, vlm_device_map):
 
 
     print("Initializing Client...")
-    # Logic: Explicit Local Flag OR Missing API Key -> Use Local Weights
-    if args.use_local_model_weight or not args.openai_api_key:
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
         print(f"  Using Local Model Weights from {args.local_model_weight_path}")
         client = LocalQwen3VLWrapper(args.local_model_weight_path, device_map=vlm_device_map)
         # Override llm_model arg to avoid confusion, though wrapper ignores it
@@ -180,6 +191,10 @@ if __name__ == "__main__":
     # Create logs directory
     logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
     os.makedirs(logs_dir, exist_ok=True)
+
+    # Start Resource Monitor
+    monitor = ResourceMonitor(interval=1.0)
+    monitor.start()
 
     # Save Run Configuration
     config_path = os.path.join(logs_dir, "run_config.txt")
@@ -268,7 +283,15 @@ if __name__ == "__main__":
 
         f_log.close()
 
+
+    # Stop Monitor and Save Plots
+    monitor.stop()
+    monitor.save_plots(logs_dir)
+    print(f"Resource usage plots saved to {os.path.join(logs_dir, 'resource_usage.png')}")
     end_time = time.time()
     elapsed_time = end_time - start_time
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")

@@ -15,6 +15,8 @@ Usage:
       --omnigen2_path ./OmniGen2 \
       --openai_api_key "sk-..."
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
@@ -40,9 +42,11 @@ parser.add_argument("--openai_api_key", type=str, required=False, help="Required
 parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Local Weights Config
-parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
 parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
 parser.add_argument("--enable_offload", action="store_true", help="Enable CPU offloading for OmniGen to save VRAM")
+parser.add_argument("--enable_teacache", action="store_true", help="Enable TeaCache acceleration")
+parser.add_argument("--teacache_thresh", type=float, default=0.4, help="TeaCache relative L1 threshold")
+parser.add_argument("--enable_taylorseer", action="store_true", help="Enable TaylorSeer acceleration")
 
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
@@ -81,7 +85,7 @@ import clip
 # [IMPORTS] BC + SR
 from binary_critic import retrieval_caption_generation  # Binary Critic
 from memory_guided_retrieval import retrieve_img_per_caption   # Static Retrieval
-from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient
+from rag_utils import LocalQwen3VLWrapper, UsageTrackingClient, ResourceMonitor, RUN_STATS
 # ------------------------------------------------------------------
 
 def seed_everything(seed):
@@ -93,11 +97,20 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_BC_SR_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_BC_SR_Aircraft_{run_time}"
 }
 
 def setup_system(omnigen_device, vlm_device_map):
@@ -113,6 +126,33 @@ def setup_system(omnigen_device, vlm_device_map):
         )
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
+
+        # Handle mutual exclusion between TeaCache and TaylorSeer
+        if args.enable_teacache and args.enable_taylorseer:
+            print("WARNING: enable_teacache and enable_taylorseer are mutually exclusive. TeaCache will be ignored in favor of TaylorSeer.")
+            args.enable_teacache = False
+
+        # Apply Accelerations
+        if args.enable_taylorseer:
+            print("Enabling TaylorSeer acceleration...")
+            pipe.enable_taylorseer = True
+            # Disable TeaCache explicitly just in case
+            if hasattr(pipe.transformer, "enable_teacache"):
+                pipe.transformer.enable_teacache = False
+        elif args.enable_teacache:
+            if hasattr(pipe.transformer, "enable_teacache"):
+                print(f"Enabling TeaCache for OmniGen2 (threshold={args.teacache_thresh})...")
+                pipe.transformer.enable_teacache = True
+                pipe.transformer.rel_l1_thresh = args.teacache_thresh
+            else:
+                print("Warning: pipe.transformer does not have enable_teacache attribute. Ignoring.")
+                pipe.transformer.enable_teacache = False
+        else:
+            # Disable both
+            if hasattr(pipe.transformer, "enable_teacache"):
+                pipe.transformer.enable_teacache = False
+            pipe.enable_taylorseer = False
+
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
         if args.enable_offload:
@@ -128,8 +168,8 @@ def setup_system(omnigen_device, vlm_device_map):
 
 
     print("Initializing Client...")
-    # Logic: Explicit Local Flag OR Missing API Key -> Use Local Weights
-    if args.use_local_model_weight or not args.openai_api_key:
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
         print(f"  Using Local Model Weights from {args.local_model_weight_path}")
         client = LocalQwen3VLWrapper(args.local_model_weight_path, device_map=vlm_device_map)
         # Override llm_model arg to avoid confusion, though wrapper ignores it
@@ -249,6 +289,10 @@ if __name__ == "__main__":
     logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
+    # Start Resource Monitor
+    monitor = ResourceMonitor(interval=1.0)
+    monitor.start()
+
     # Save Run Configuration
     config_path = os.path.join(logs_dir, "run_config.txt")
     with open(config_path, "w") as f:
@@ -355,7 +399,15 @@ if __name__ == "__main__":
 
         f_log.close()
 
+
+    # Stop Monitor and Save Plots
+    monitor.stop()
+    monitor.save_plots(logs_dir)
+    print(f"Resource usage plots saved to {os.path.join(logs_dir, 'resource_usage.png')}")
     end_time = time.time()
     elapsed_time = end_time - start_time
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")

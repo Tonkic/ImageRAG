@@ -15,27 +15,12 @@ Usage:
       --openai_api_key "sk-..." \
       --seed 42
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
 import os
-import json
-import shutil
-import numpy as np
-import torch
-from PIL import Image
-from tqdm import tqdm
-import random
-import openai
-import clip
-
-# [IMPORTS]
-from binary_critic import retrieval_caption_generation  # Critic
-from memory_guided_retrieval import retrieve_img_per_caption
-from global_memory import GlobalMemory # MGR Logic
-from diffusers import FluxFillPipeline
-from diffusers.utils import load_image
-from PIL import Image, ImageDraw
 
 # --- 1. Argument Parsing ---
 parser = argparse.ArgumentParser(description="FLUX + BC + MGR (Aircraft)")
@@ -60,6 +45,24 @@ args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
 print(f"DEBUG: CUDA_VISIBLE_DEVICES set to {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+import json
+import shutil
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+import random
+import openai
+import clip
+
+# [IMPORTS]
+from binary_critic import retrieval_caption_generation  # Critic
+from memory_guided_retrieval import retrieve_img_per_caption
+from global_memory import GlobalMemory # MGR Logic
+from diffusers import FluxFillPipeline
+from diffusers.utils import load_image
+from PIL import Image, ImageDraw
 print(f"DEBUG: Torch sees {torch.cuda.device_count()} devices. Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})")
 
 def seed_everything(seed):
@@ -72,11 +75,20 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 # --- 2. Config ---
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/FLUX_BC_MGR_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/FLUX_BC_MGR_Aircraft_{run_time}"
 }
 
 # --- 3. Setup ---

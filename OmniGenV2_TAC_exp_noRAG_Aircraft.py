@@ -16,6 +16,8 @@ Usage:
       --omnigen2_path ./OmniGen2 \
       --openai_api_key "sk-..."
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
@@ -119,11 +121,20 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
 
 # --- 2. Config ---
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_exp_noRAG_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_TAC_exp_noRAG_Aircraft_{run_time}"
 }
 
 # --- 3. Setup ---
@@ -155,8 +166,8 @@ def setup_system(omnigen_device, vlm_device_map):
         sys.exit(1)
 
     print("Initializing Client...")
-    # Logic: Explicit Local Flag OR Missing API Key -> Use Local Weights
-    if args.use_local_model_weight or not args.openai_api_key:
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
         print(f"  Using Local Model Weights from {args.local_model_weight_path}")
         client = LocalQwen3VLWrapper(args.local_model_weight_path, device_map=vlm_device_map)
         # Override llm_model arg to avoid confusion, though wrapper ignores it
@@ -405,3 +416,6 @@ if __name__ == "__main__":
     elapsed_time = end_time - start_time
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")

@@ -330,10 +330,10 @@ def info_nce_loss(text_embeddings, image_embeddings, memory_bank=None, temperatu
 # -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen2.5-VL for Retrieval (VLM2Vec)")
+    parser = argparse.ArgumentParser(description="Fine-tune Qwen3-VL for Retrieval (VLM2Vec)")
     parser.add_argument("--dataset", type=str, required=True, choices=["aircraft", "cub"], help="Dataset name")
     parser.add_argument("--dataset_root", type=str, required=True, help="Path to dataset root")
-    parser.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct", help="Model path")
+    parser.add_argument("--model_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct", help="Model path")
     parser.add_argument("--output_dir", type=str, default="output/vlm2vec_finetuned", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")

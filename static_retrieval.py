@@ -5,6 +5,7 @@ from open_clip import create_model_from_pretrained, get_tokenizer
 import torch.nn.functional as F
 from PIL import Image
 import numpy as np
+from tqdm import tqdm
 
 # [Optional] Long-CLIP Imports
 import sys
@@ -53,11 +54,21 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
 
             if os.path.exists(cache_file):
                 # 加载缓存
-                data = torch.load(cache_file, map_location=device, weights_only=True)
-                normalized_im_vectors = data['normalized_clip_embeddings']
-                # 校验缓存路径是否匹配 (可选)
-                final_bi_paths = data.get('paths', current_batch_paths)
-            else:
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=True)
+                    cached_emb = data['normalized_clip_embeddings']
+                    # Dimension Check
+                    if cached_emb.shape[-1] == normalized_text_vectors.shape[-1]:
+                        normalized_im_vectors = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached CLIP embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {normalized_text_vectors.shape[-1]}. Ignoring cache.")
+                        normalized_im_vectors = None
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
+                    normalized_im_vectors = None
+
+            if not os.path.exists(cache_file) or normalized_im_vectors is None:
                 # 计算 Embedding
                 images = []
                 valid_paths = []
@@ -151,11 +162,21 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
             current_batch_paths = image_paths[bi : bi + bs]
 
             if os.path.exists(cache_file):
-                data = torch.load(cache_file, map_location=device)
-                normalized_im_vectors = data['normalized_siglip_embeddings']
-                final_bi_paths = data.get('paths', current_batch_paths)
+                try:
+                    data = torch.load(cache_file, map_location=device)
+                    cached_emb = data['normalized_siglip_embeddings']
+                    # Dimension Check
+                    if cached_emb.shape[-1] == normalized_text_vectors.shape[-1]:
+                        normalized_im_vectors = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached SigLIP embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {normalized_text_vectors.shape[-1]}. Ignoring cache.")
+                        normalized_im_vectors = None
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
+                    normalized_im_vectors = None
 
-            elif save:
+            if not os.path.exists(cache_file) or normalized_im_vectors is None:
                 # 仅当 save=True 时才计算并保存，否则跳过 (为了速度)
                 images = []
                 valid_paths = []
@@ -246,8 +267,15 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
             if os.path.exists(cache_file):
                 try:
                     data = torch.load(cache_file, map_location=device, weights_only=False)
-                    normalized_im_vectors = data['normalized_siglip2_embeddings']
-                    final_bi_paths = data.get('paths', current_batch_paths)
+                    cached_emb = data['normalized_siglip2_embeddings']
+                     # Dimension Check
+                    if cached_emb.shape[-1] == normalized_text_vectors.shape[-1]:
+                        normalized_im_vectors = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached SigLIP2 embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {normalized_text_vectors.shape[-1]}. Ignoring cache.")
+                        normalized_im_vectors = None
+
                 except Exception as e:
                     print(f"Error loading cache {cache_file}: {e}")
                     normalized_im_vectors = None
@@ -300,7 +328,7 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
     return top_paths, top_scores
 
 
-def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP'):
+def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', adapter_path=None, use_hybrid=False, external_model=None, external_processor=None):
     """
     统一入口函数。
     返回:
@@ -309,6 +337,12 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
     """
     all_retrieved_paths = []
     all_retrieved_scores = []
+
+    # Check for global shared model if not provided
+    if external_model is None:
+        import sys
+        external_model = getattr(sys.modules.get("__main__"), "GLOBAL_QWEN_MODEL", None)
+        external_processor = getattr(sys.modules.get("__main__"), "GLOBAL_QWEN_PROCESSOR", None)
 
     for caption in captions:
         if method == 'CLIP':
@@ -334,6 +368,15 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 [caption], image_paths,
                 embeddings_path=embeddings_path,
                 k=k, device=device
+            )
+        elif method == 'Qwen3-VL':
+            paths, scores = get_qwen3_vl_similarities(
+                [caption], image_paths,
+                embeddings_path=embeddings_path,
+                k=k, device=device, save=True,
+                adapter_path=adapter_path,
+                external_model=external_model,
+                external_processor=external_processor
             )
         else:
             print(f"Unknown method {method}, falling back to CLIP")
@@ -386,10 +429,21 @@ def get_longclip_similarities(prompts, image_paths, embeddings_path="", bs=1024,
             current_batch_paths = image_paths[bi : bi + bs]
 
             if os.path.exists(cache_file):
-                data = torch.load(cache_file, map_location=device, weights_only=False)
-                normalized_im_vectors = data['normalized_clip_embeddings']
-                final_bi_paths = data.get('paths', current_batch_paths)
-            else:
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    cached_emb = data['normalized_clip_embeddings']
+                    # Dimension Check
+                    if cached_emb.shape[-1] == normalized_text_vectors.shape[-1]:
+                        normalized_im_vectors = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached Long-CLIP embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {normalized_text_vectors.shape[-1]}. Ignoring cache.")
+                        normalized_im_vectors = None
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
+                    normalized_im_vectors = None
+
+            if not os.path.exists(cache_file) or normalized_im_vectors is None:
                 images = []
                 valid_paths = []
                 for path in current_batch_paths:
@@ -434,3 +488,177 @@ def get_longclip_similarities(prompts, image_paths, embeddings_path="", bs=1024,
     top_scores = single_prompt_scores[top_indices].tolist()
 
     return top_paths, top_scores
+
+def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=50, device='cuda:0', save=False, adapter_path=None, external_model=None, external_processor=None):
+    """
+    Qwen3-VL Retrieval
+    """
+    try:
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+
+        if external_model is not None and external_processor is not None:
+            print("Using shared external Qwen3-VL model for retrieval...")
+            model = external_model
+            processor = external_processor
+        else:
+            # Use local path
+            model_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
+
+            print(f"Loading Qwen3-VL from {model_name}...")
+            processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device,
+                trust_remote_code=True
+            )
+
+            if adapter_path:
+                try:
+                    from peft import PeftModel
+                    print(f"Loading LoRA adapter from {adapter_path}...")
+                    model = PeftModel.from_pretrained(model, adapter_path)
+                except ImportError:
+                    print("Warning: peft not installed, cannot load adapter.")
+                except Exception as e:
+                    print(f"Error loading adapter: {e}")
+
+            model.eval()
+    except Exception as e:
+        print(f"Error loading Qwen3-VL: {e}")
+        return [], []
+
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # 1. Encode Queries (Text)
+    query_embeddings = []
+    with torch.no_grad():
+        for p in prompts:
+            # Instruction for retrieval
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Retrieve the image that matches the description: {p}"}
+                    ]
+                }
+            ]
+            # Prepare inputs
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(device)
+
+            # Forward pass
+            outputs = model(**inputs, output_hidden_states=True)
+            # Last layer, last token
+            last_hidden_state = outputs.hidden_states[-1]
+            emb = last_hidden_state[:, -1, :] # [1, Dim]
+            query_embeddings.append(emb)
+
+    query_embeddings = torch.cat(query_embeddings, dim=0)
+    query_embeddings = F.normalize(query_embeddings, p=2, dim=-1)
+
+    all_scores = []
+    all_paths = []
+
+    # 2. Encode Documents (Images)
+    print(f"Encoding {len(image_paths)} images with Qwen3-VL (Batch Size: {bs})...")
+    with torch.no_grad():
+        for bi in tqdm(range(0, len(image_paths), bs), desc="Qwen3-VL Embedding"):
+            cache_file = os.path.join(embeddings_path, f"qwen3_vl_embeddings_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            batch_doc_embeddings = None
+            final_bi_paths = []
+
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+                    cached_emb = data['embeddings']
+                    # Dimension Check
+                    if cached_emb.shape[-1] == query_embeddings.shape[-1]:
+                        batch_doc_embeddings = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {query_embeddings.shape[-1]}. Ignoring cache.")
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
+
+            if batch_doc_embeddings is None and save:
+                images = []
+                valid_paths = []
+                for path in current_batch_paths:
+                    try:
+                        images.append(Image.open(path).convert("RGB"))
+                        valid_paths.append(path)
+                    except: continue
+
+                if not images: continue
+
+                batch_embs = []
+                for img in images:
+                    # Construct message with image
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": "Represent this image for retrieval."}
+                            ]
+                        }
+                    ]
+                    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+                    inputs = processor(
+                        text=[text_prompt],
+                        images=[img],
+                        return_tensors="pt",
+                        padding=True
+                    ).to(device)
+
+                    outputs = model(**inputs, output_hidden_states=True)
+                    last_hidden_state = outputs.hidden_states[-1]
+                    emb = last_hidden_state[:, -1, :]
+                    batch_embs.append(emb)
+
+                if batch_embs:
+                    batch_doc_embeddings = torch.cat(batch_embs, dim=0)
+                    final_bi_paths = valid_paths
+
+                    if embeddings_path:
+                        os.makedirs(embeddings_path, exist_ok=True)
+                        torch.save({"embeddings": batch_doc_embeddings, "paths": final_bi_paths}, cache_file)
+
+            if batch_doc_embeddings is not None:
+                batch_doc_embeddings = batch_doc_embeddings.to(device)
+                batch_doc_embeddings = F.normalize(batch_doc_embeddings, p=2, dim=-1)
+
+                sim_matrix = query_embeddings @ batch_doc_embeddings.T
+                all_scores.append(sim_matrix.float().cpu().numpy())
+                all_paths.extend(final_bi_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+
+    final_paths_list = []
+    final_scores_list = []
+
+    for i in range(len(prompts)):
+        scores = full_scores[i]
+        top_indices = np.argsort(scores)[-k:][::-1]
+        top_paths = [all_paths[idx] for idx in top_indices]
+        top_scores = scores[top_indices].tolist()
+        final_paths_list.append(top_paths)
+        final_scores_list.append(top_scores)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return final_paths_list[0], final_scores_list[0]

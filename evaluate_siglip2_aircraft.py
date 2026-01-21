@@ -1,12 +1,7 @@
 '''
-Evaluation Script for Aircraft (All Methods)
+Evaluation Script for Aircraft (SigLIP2 Experiment)
 =======================================================
-Methods Evaluated:
-  1. Baseline (V1) - Shared
-  2. BC + SR
-  3. BC + MGR
-  4. TAC + SR
-  5. TAC + MGR
+Target: results/siglip2/OmniGenV2_TAC_MGR_Aircraft
 
 Metrics:
   - CLIP Score
@@ -25,7 +20,7 @@ import cv2
 # --------------------------------------------------
 # --- 1. Args (Parse BEFORE importing torch) ---
 # --------------------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate Aircraft (All Methods)")
+parser = argparse.ArgumentParser(description="Evaluate Aircraft (SigLIP2)")
 parser.add_argument("--device_id", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
@@ -65,12 +60,7 @@ DATASET_CONFIG = {
 }
 
 METHODS = {
-    "BC_noRAG": "results/OmniGenV2_BC_noRAG_Aircraft",
-    "BC_SR": "results/OmniGenV2_BC_SR_Aircraft",
-    "TAC_noRAG": "results/OmniGenV2_TAC_noRAG_Aircraft",
-    "TAC_exp_noRAG": "results/OmniGenV2_TAC_exp_noRAG_Aircraft",
-    "TAC_exp_SR": "results/OmniGenV2_TAC_exp_SR_Aircraft",
-    "TAC_SR": "results/OmniGenV2_TAC_SR_Aircraft"
+    "TAC_MGR_SigLIP2": "results/siglip2/OmniGenV2_TAC_MGR_Aircraft"
 }
 
 # --------------------------------------------------
@@ -215,11 +205,6 @@ def get_best_image_path(method_name, dir_path, safe_filename_prefix):
         if not best_v_path: # Also check V10..V2 if V1 not found? No, loop above does V10..V2.
            pass
 
-    # The above fallback logic has a bug in original:
-    # Original: V10 down to V2. Then if not best_v_path, check V1.
-    # So if V1 exists it sets best_v_path.
-
-    # Correcting structure here:
     if best_v_path: return best_v_path
 
     v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
@@ -303,27 +288,6 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=
 # --------------------------------------------------
 # --- 5. Main ---
 # --------------------------------------------------
-def parse_log_file(file_path):
-    metrics = {}
-    try:
-        with open(file_path, 'r') as f:
-            for line in f:
-                if ":" in line:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        key, val = parts[0].strip(), parts[1].strip()
-                        try:
-                            val = float(val)
-                            if "CLIP" in key: metrics['clip'] = val
-                            elif "SigLIP" in key: metrics['siglip'] = val
-                            elif "DINO v3" in key: metrics['dino_v3'] = val
-                            elif "KID" in key: metrics['kid'] = val
-                            elif "FID" in key: metrics['fid'] = val
-                            elif "Laplacian" in key: metrics['lap_var'] = val
-                        except: pass
-        return metrics
-    except: return None
-
 def main():
     seed = 0
     random.seed(seed)
@@ -335,152 +299,127 @@ def main():
     # 1. Load Tasks First (Fast)
     tasks = load_aircraft_tasks(DATASET_CONFIG)
 
-    # 2. Check for existing logs
-    print(f"\nChecking for existing evaluation logs...")
-    cached_results = {}
-    methods_to_evaluate = []
+    # 2. Pre-scan Counts
+    print(f"\nScanning generated images for {len(tasks)} tasks...")
+    counts = {m: 0 for m in METHODS.keys()}
+    for task in tasks:
+        for method_name, dir_path in METHODS.items():
+            if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
+                counts[method_name] += 1
 
-    for method_name, dir_path in METHODS.items():
-        log_file = os.path.join(dir_path, "logs", "evaluation_metrics.txt")
-        if os.path.exists(log_file):
-            metrics = parse_log_file(log_file)
-            if metrics:
-                print(f"  [Cached] Found logs for {method_name}")
-                cached_results[method_name] = metrics
-                continue
-        methods_to_evaluate.append(method_name)
+    print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
+    for m in METHODS.keys():
+        print(f"    - {m:<15}: {counts[m]}")
+    print("-" * 80)
 
-    if not methods_to_evaluate:
-        print("\nAll methods have cached results. Skipping evaluation loop.")
-    else:
-        print(f"\nMethods to evaluate: {methods_to_evaluate}")
+    models = load_models(device)
 
-    # 3. Evaluation Loop (Only if needed)
-    results = {}
-    models = {}
+    # Storage for results
+    results = {m: [] for m in METHODS.keys()}
+    results["GroundTruth"] = []
 
-    if methods_to_evaluate:
-        # Pre-scan only if running eval
-        print(f"\nScanning generated images for {len(tasks)} tasks...")
-        counts = {m: 0 for m in methods_to_evaluate}
-        for task in tasks:
-            for method_name in methods_to_evaluate:
-                dir_path = METHODS[method_name]
-                if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
-                    counts[method_name] += 1
+    print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
 
-        print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
-        for m in methods_to_evaluate:
-            print(f"    - {m:<15}: {counts[m]}")
-        print("-" * 80)
+    for task in tqdm(tasks):
+        # [Optimization] Pre-check if any generated image exists
+        task_img_paths = {}
+        for method_name, dir_path in METHODS.items():
+            p = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
+            if p:
+                task_img_paths[method_name] = p
 
-        models = load_models(device)
+        # 1. Get Real Features
+        real_paths = task["real_image_paths"]
+        if not real_paths: continue
 
-        # Init results
-        results = {m: [] for m in methods_to_evaluate}
-        results["GroundTruth"] = []
+        real_feats = {}
+        # V3
+        if 'dino_v3' in models:
+            real_feats['v3'] = get_dino_features_batch(real_paths, models['dino_v3'], models['dino_transform'], device)
+        else:
+            real_feats['v3'] = None
 
-        print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
+        real_feats['v2'] = get_dino_features_batch(real_paths, models['dino_v2'], models['dino_transform'], device)
+        real_feats['v1'] = get_dino_features_batch(real_paths, models['dino_v1'], models['dino_transform'], device)
 
-        for task in tqdm(tasks):
-            # [Optimization] Pre-check if any generated image exists for methods to evaluate
-            task_img_paths = {}
-            for method_name in methods_to_evaluate:
-                dir_path = METHODS[method_name]
-                p = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
-                if p:
-                    task_img_paths[method_name] = p
+        if any(v is None for k,v in real_feats.items() if k != 'v3'):
+            continue # Skip if v1 or v2 failed. v3 is optional if not loaded?
 
-            # GroundTruth always needs real paths
-            real_paths = task["real_image_paths"]
-            if not real_paths: continue
+        # 2. Get Text Features (Moved before GT eval)
+        txt_feats = {}
+        with torch.no_grad():
+            if models.get('clip_tokenizer'):
+                ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
+                txt_feats['clip'] = models['clip_model'].encode_text(ctk)
+                txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
 
-            # 1. Get Real Features
-            real_feats = {}
-            # V3
-            if 'dino_v3' in models:
-                real_feats['v3'] = get_dino_features_batch(real_paths, models['dino_v3'], models['dino_transform'], device)
-            else:
-                real_feats['v3'] = None
-
-            real_feats['v2'] = get_dino_features_batch(real_paths, models['dino_v2'], models['dino_transform'], device)
-            real_feats['v1'] = get_dino_features_batch(real_paths, models['dino_v1'], models['dino_transform'], device)
-
-            if any(v is None for k,v in real_feats.items() if k != 'v3'):
-                continue
-
-            # 2. Get Text Features
-            txt_feats = {}
-            with torch.no_grad():
-                if models.get('clip_tokenizer'):
-                    ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
-                    txt_feats['clip'] = models['clip_model'].encode_text(ctk)
-                    txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
-
-                # SigLIP
-                if models.get('siglip_tokenizer'):
-                    try:
-                        stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
-                    except AttributeError:
-                        if hasattr(models['siglip_tokenizer'], 'tokenizer'):
-                            internal_tok = models['siglip_tokenizer'].tokenizer
-                            if hasattr(internal_tok, '__call__'):
-                                res = internal_tok([task["prompt"]], padding='max_length', truncation=True, max_length=64, return_tensors='pt')
-                                stk = res['input_ids'].to(device)
-                            else: stk = None
+            # SigLIP
+            if models.get('siglip_tokenizer'):
+                try:
+                    stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+                except AttributeError:
+                    if hasattr(models['siglip_tokenizer'], 'tokenizer'):
+                        internal_tok = models['siglip_tokenizer'].tokenizer
+                        if hasattr(internal_tok, '__call__'):
+                            res = internal_tok([task["prompt"]], padding='max_length', truncation=True, max_length=64, return_tensors='pt')
+                            stk = res['input_ids'].to(device)
                         else: stk = None
+                    else: stk = None
 
-                    if stk is not None:
-                        txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
-                        txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
+                if stk is not None:
+                    txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
+                    txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
 
-            # 3. Update KID & FID (Real) with ALL valid real images
-            use_paths = real_paths[:50]
-            for r_path in use_paths:
-                try:
-                    kt = models['kid_transform'](Image.open(r_path).convert("RGB")).unsqueeze(0).to(device)
-                    # Update only for methods being evaluated + GT
-                    for m_key in models['kid'].keys():
-                         if m_key in methods_to_evaluate or m_key == "GroundTruth":
-                            models['kid'][m_key].update(kt, real=True)
-                            models['fid'][m_key].update(kt, real=True)
-                except: pass
+        # 3. Update KID & FID (Real) with ALL valid real images
+        # This provides the REFERENCE distribution (Real) for all methods.
+        use_paths = real_paths[:50] # Limit to 50 for speed? Or uses all? Default to 50 in get_dino_features_batch, lets match here.
+        for r_path in use_paths:
+             try:
+                 kt = models['kid_transform'](Image.open(r_path).convert("RGB")).unsqueeze(0).to(device)
+                 # Update for all methods including GroundTruth (Real vs Real)
+                 for m_key in models['kid'].keys():
+                     models['kid'][m_key].update(kt, real=True)
+                     models['fid'][m_key].update(kt, real=True)
+             except: pass
 
-            # 4. Evaluate Ground Truth
-            gt_samples = random.sample(real_paths, min(len(real_paths), 3))
-            gt_scores_accum = defaultdict(list)
+        # 4. Evaluate Ground Truth (metrics on real images)
+        gt_samples = random.sample(real_paths, min(len(real_paths), 3))
+        gt_scores_accum = defaultdict(list)
 
-            for gt_img_path in gt_samples:
-                s_res = evaluate_single(gt_img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
-                if s_res:
-                    for k, v in s_res.items():
-                        gt_scores_accum[k].append(v)
+        for gt_img_path in gt_samples:
+            s_res = evaluate_single(gt_img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+            if s_res:
+                for k, v in s_res.items():
+                    gt_scores_accum[k].append(v)
 
-                try:
-                    img_tensor = models['kid_transform'](Image.open(gt_img_path).convert("RGB")).unsqueeze(0).to(device)
-                    models['kid']['GroundTruth'].update(img_tensor, real=False)
-                    models['fid']['GroundTruth'].update(img_tensor, real=False)
-                except: pass
+            # Update KID/FID as "Fake" for GroundTruth method (Real vs Real)
+            try:
+                img_tensor = models['kid_transform'](Image.open(gt_img_path).convert("RGB")).unsqueeze(0).to(device)
+                models['kid']['GroundTruth'].update(img_tensor, real=False)
+                models['fid']['GroundTruth'].update(img_tensor, real=False)
+            except: pass
 
-            if gt_scores_accum:
-                gt_final_res = {k: np.mean(v) for k, v in gt_scores_accum.items()}
-                results['GroundTruth'].append(gt_final_res)
+        if gt_scores_accum:
+            gt_final_res = {k: np.mean(v) for k, v in gt_scores_accum.items()}
+            # gt_ms_ssim Removed
+            results['GroundTruth'].append(gt_final_res)
 
-            # 5. Evaluate Generated Images
-            for method_name, img_path in task_img_paths.items():
-                s_res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
-                if s_res:
-                    results[method_name].append(s_res)
+        # 5. Evaluate Generated Images
+        for method_name, img_path in task_img_paths.items():
+            s_res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+            if s_res:
+                results[method_name].append(s_res)
 
-                try:
-                    img_tensor = models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
-                    models['kid'][method_name].update(img_tensor, real=False)
-                    models['fid'][method_name].update(img_tensor, real=False)
-                except: pass
+            # Update KID/FID (Fake)
+            try:
+                img_tensor = models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
+                models['kid'][method_name].update(img_tensor, real=False)
+                models['fid'][method_name].update(img_tensor, real=False)
+            except: pass
 
     # Report
     print("\n" + "="*120)
-    print(f"  EVAL REPORT: Aircraft (All Methods)")
+    print(f"  EVAL REPORT: Aircraft (SigLIP2 Experiment)")
     print("="*120)
 
     print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8}")
@@ -489,25 +428,9 @@ def main():
     all_methods_ordered = ["GroundTruth"] + list(METHODS.keys())
 
     for method_name in all_methods_ordered:
-        # 1. Use Cached if available
-        if method_name in cached_results:
-            m = cached_results[method_name]
-            # Use safe get
-            c_s = m.get('clip', 0)
-            s_s = m.get('siglip', 0)
-            d3 = m.get('dino_v3', 0)
-            kv = m.get('kid', 0)
-            fv = m.get('fid', 0)
-            lv = m.get('lap_var', 0)
-            cached_suffix = " (Cached)"
-            print(f"{method_name:<15} | {c_s:.4f}   | {s_s:.4f}   | {d3:.4f}   | {kv:.5f} | {fv:.4f} | {lv:.1f}{cached_suffix}")
-            continue
-
-        # 2. Results from current run
         lst = results.get(method_name, [])
         if not lst:
-            if method_name in methods_to_evaluate or method_name == "GroundTruth":
-                 print(f"{method_name:<15} | N/A")
+            print(f"{method_name:<15} | N/A")
             continue
 
         try:
@@ -532,26 +455,6 @@ def main():
         lap_var = np.mean([x.get('laplacian_var', 0) for x in lst])
 
         print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}")
-
-        # Save to logs
-        if method_name in METHODS:
-            try:
-                dir_path = METHODS[method_name]
-                log_dir = os.path.join(dir_path, "logs")
-                os.makedirs(log_dir, exist_ok=True)
-                log_file = os.path.join(log_dir, "evaluation_metrics.txt")
-
-                with open(log_file, "w") as f:
-                    f.write(f"Evaluation Metrics for {method_name}\n")
-                    f.write("="*50 + "\n")
-                    f.write(f"CLIP Score: {clip_s:.4f}\n")
-                    f.write(f"SigLIP Score: {siglip_s:.4f}\n")
-                    f.write(f"DINO v3 Score: {d3:.4f}\n")
-                    f.write(f"KID Score: {kid_val:.5f}\n")
-                    f.write(f"FID Score: {fid_val:.4f}\n")
-                    f.write(f"Laplacian Variance: {lap_var:.1f}\n")
-            except Exception as e:
-                print(f"  -> Failed to save logs for {method_name}: {e}")
 
     print("="*120)
 

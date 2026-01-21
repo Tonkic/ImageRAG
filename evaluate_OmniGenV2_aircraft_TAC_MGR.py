@@ -11,7 +11,6 @@ Metrics:
   - KID (Kernel Inception Distance)
   - FID (Frechet Inception Distance)
   - Laplacian Variance (Blurriness)
-  - Pairwise MS-SSIM (Diversity within generated group - if applicable)
 '''
 
 import os
@@ -48,13 +47,6 @@ import open_clip
 from open_clip import create_model_from_pretrained, get_tokenizer
 from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.ssim import MultiScaleStructuralSimilarityIndexMeasure
-
-# [New] Imports for ColQwen3
-try:
-    from transformers import AutoModel, AutoProcessor, AutoConfig
-except ImportError:
-    print("Transformers not found.")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -125,7 +117,7 @@ def load_models(device):
         models['dino_v3'] = models['dino_v3'].to(device).eval()
     except Exception as e:
         print(f"Error loading DINO v3: {e}")
-        sys.exit(1)
+        # sys.exit(1) # don't exit
 
     # 2. DINO v2
     print("Loading DINO v2...")
@@ -152,30 +144,14 @@ def load_models(device):
     print("Initializing KID & FID...")
     models['kid'] = {}
     models['fid'] = {}
-    for m in METHODS.keys():
+    # Track GroundTruth as well
+    ALL_METHODS = list(METHODS.keys()) + ["GroundTruth"] # Modified to match consistent logic
+    for m in ALL_METHODS:
         # Reduced subset_size to 5 to allow calculation with fewer samples
         models['kid'][m] = KernelInceptionDistance(subset_size=5, normalize=True).to(device)
         models['fid'][m] = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
 
     models['kid_transform'] = T.Compose([T.Resize(299), T.CenterCrop(299), T.ToTensor()])
-
-    # 7. MS-SSIM
-    print("Initializing MS-SSIM...")
-    models['ms_ssim'] = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    models['ssim_transform'] = T.Compose([T.Resize((256, 256)), T.ToTensor()])
-
-    # 8. ColQwen3
-    print("Loading ColQwen3...")
-    try:
-        # Load model directly
-        models['colqwen3_model'] = AutoModel.from_pretrained(
-            "TomoroAI/tomoro-colqwen3-embed-8b",
-            trust_remote_code=True,
-            dtype="auto"
-        ).to(device).eval()
-        models['colqwen3_processor'] = AutoProcessor.from_pretrained("TomoroAI/tomoro-colqwen3-embed-8b", trust_remote_code=True)
-    except Exception as e:
-        print(f"Error loading ColQwen3: {e}")
 
     return models
 
@@ -224,56 +200,19 @@ def get_best_image_path(method_name, dir_path, safe_filename_prefix):
     # Fallback logic: Find highest V number (up to V10)
     best_v_path = None
     for i in range(10, 1, -1): # Check V10 down to V2
-        p = os.path.join(dir_path, f"{safe_filename_prefix}_V{i}.png")
+        p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
         if os.path.exists(p):
             best_v_path = p
-            break
+        if not best_v_path: # Also check V10..V2 if V1 not found? No, loop above does V10..V2.
+           pass 
+            
+    if best_v_path: return best_v_path
+    
+    v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
+    if os.path.exists(v1_p):
+        return v1_p
 
-    # If no V2-V10, check V1
-    if not best_v_path:
-        v1_p = os.path.join(dir_path, f"{safe_filename_prefix}_V1.png")
-        if os.path.exists(v1_p):
-            best_v_path = v1_p
-
-    if best_v_path and os.path.exists(best_v_path):
-        return best_v_path
     return None
-
-def get_group_images(dir_path, safe_filename_prefix):
-    """
-    Find all group images for the latest retry.
-    Pattern: {safe_filename_prefix}_retry{N}_group{M}.png
-    """
-    # Find max retry
-    max_retry = -1
-    pattern = os.path.join(dir_path, f"{safe_filename_prefix}_retry*_group*.png")
-    files = glob.glob(pattern)
-
-    if not files:
-        return []
-
-    for f in files:
-        try:
-            # Extract retry number
-            base = os.path.basename(f)
-            parts = base.split('_retry')
-            if len(parts) > 1:
-                retry_part = parts[1].split('_group')[0]
-                retry_num = int(retry_part)
-                if retry_num > max_retry:
-                    max_retry = retry_num
-        except: pass
-
-    if max_retry == -1:
-        return []
-
-    # Collect all images for max_retry
-    group_images = []
-    target_pattern = os.path.join(dir_path, f"{safe_filename_prefix}_retry{max_retry}_group*.png")
-    for f in glob.glob(target_pattern):
-        group_images.append(f)
-
-    return group_images
 
 def get_dino_features_batch(paths, model, transform, device, batch_size=32):
     feats = []
@@ -302,24 +241,6 @@ def calculate_laplacian_variance(img_path):
         # print(f"Error calculating Laplacian Variance: {e}")
         return 0.0
 
-def calculate_pairwise_ms_ssim(img_paths, model, transform, device):
-    if len(img_paths) < 2:
-        return None
-    
-    # Randomly pick 2
-    pair = random.sample(img_paths, 2)
-    
-    try:
-        img1 = transform(Image.open(pair[0]).convert("RGB")).unsqueeze(0).to(device)
-        img2 = transform(Image.open(pair[1]).convert("RGB")).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            score = model(img1, img2)
-        return score.item()
-    except Exception as e:
-        # print(f"Error calculating MS-SSIM: {e}")
-        return None
-
 def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=None):
     scores = {}
     try:
@@ -331,10 +252,21 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=
         with torch.no_grad():
             # DINO
             dino_in = models['dino_transform'](img).unsqueeze(0).to(device)
-            for ver in ['v1', 'v2', 'v3']:
-                out = models[f'dino_{ver}'](dino_in)
+            # v3 might not be loaded if file missing, handle gracefull
+            if 'dino_v3' in models:
+                out = models['dino_v3'](dino_in)
                 out = F.normalize(out, dim=-1)
-                scores[f'dino{ver}_base'] = F.cosine_similarity(out, real_feats_map[ver]).mean().item()
+                scores['dino_v3_base'] = F.cosine_similarity(out, real_feats_map['v3']).mean().item()
+            
+            # v2
+            out = models['dino_v2'](dino_in)
+            out = F.normalize(out, dim=-1)
+            scores['dino_v2_base'] = F.cosine_similarity(out, real_feats_map['v2']).mean().item()
+
+            # v1
+            out = models['dino_v1'](dino_in)
+            out = F.normalize(out, dim=-1)
+            scores['dino_v1_base'] = F.cosine_similarity(out, real_feats_map['v1']).mean().item()
 
             # CLIP
             c_in = models['clip_preprocess'](img).unsqueeze(0).to(device)
@@ -348,47 +280,31 @@ def evaluate_single(img_path, real_feats_map, txt_feats, models, device, prompt=
             s_feat = F.normalize(s_feat, dim=-1)
             scores['siglip'] = (s_feat @ txt_feats['siglip'].T).item()
 
-            # ColQwen3 MaxSim
-            if 'colqwen3' in txt_feats and 'colqwen3_model' in models:
-                processor = models['colqwen3_processor']
-                model = models['colqwen3_model']
-
-                # Process Image
-                if hasattr(processor, "process_images"):
-                    batch_images = processor.process_images([img]).to(device)
-                    image_out = model(**batch_images)
-                    if hasattr(image_out, 'embeddings'):
-                        image_emb = image_out.embeddings
-                    elif hasattr(image_out, 'last_hidden_state'):
-                        image_emb = image_out.last_hidden_state
-                    else:
-                        image_emb = image_out
-                else:
-                    inputs = processor(images=img, return_tensors="pt").to(device)
-                    image_out = model(**inputs)
-                    if hasattr(image_out, 'embeddings'):
-                        image_emb = image_out.embeddings
-                    elif hasattr(image_out, 'last_hidden_state'):
-                        image_emb = image_out.last_hidden_state
-                    else:
-                        image_emb = image_out
-
-                # MaxSim
-                Q = txt_feats['colqwen3'].to(device)
-                D = image_emb.to(device)
-
-                # Ensure dtype match
-                D = D.to(Q.dtype)
-
-                sim_matrix = torch.einsum('bqd,bnd->bqn', Q, D)
-                max_sim = sim_matrix.max(dim=-1).values
-                score = max_sim.sum(dim=-1).item()
-                scores['colqwen3_maxsim'] = score
-
     except Exception as e:
         # print(f"Error evaluating {img_path}: {e}")
         return None
     return scores
+
+def parse_log_file(file_path):
+    metrics = {}
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        key, val = parts[0].strip(), parts[1].strip()
+                        try:
+                            val = float(val)
+                            if "CLIP" in key: metrics['clip'] = val
+                            elif "SigLIP" in key: metrics['siglip'] = val
+                            elif "DINO v3" in key: metrics['dino_v3'] = val
+                            elif "KID" in key: metrics['kid'] = val
+                            elif "FID" in key: metrics['fid'] = val
+                            elif "Laplacian" in key: metrics['lap_var'] = val
+                        except: pass
+        return metrics
+    except: return None
 
 # --------------------------------------------------
 # --- 5. Main ---
@@ -404,175 +320,224 @@ def main():
     # 1. Load Tasks First (Fast)
     tasks = load_aircraft_tasks(DATASET_CONFIG)
 
-    # 2. Pre-scan Counts
-    print(f"\nScanning generated images for {len(tasks)} tasks...")
-    counts = {m: 0 for m in METHODS.keys()}
-    for task in tasks:
-        for method_name, dir_path in METHODS.items():
-            if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
-                counts[method_name] += 1
+    # 2. Check for existing logs
+    print(f"\nChecking for existing evaluation logs...")
+    cached_results = {}
+    methods_to_evaluate = []
 
-    print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
-    for m in METHODS.keys():
-        print(f"    - {m:<15}: {counts[m]}")
-    print("-" * 80)
-
-    models = load_models(device)
-
-    # Storage for results
-    results = {m: [] for m in METHODS.keys()}
-
-    print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
-
-    for task in tqdm(tasks):
-        # [Optimization] Pre-check if any generated image exists
-        task_img_paths = {}
-        for method_name, dir_path in METHODS.items():
-            p = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
-            if p:
-                task_img_paths[method_name] = p
-
-        if not task_img_paths:
-            continue
-
-        # 1. Get Real Features
-        real_paths = task["real_image_paths"]
-        if not real_paths: continue
-
-        real_feats = {}
-        for ver in ['v1', 'v2', 'v3']:
-            real_feats[ver] = get_dino_features_batch(real_paths, models[f'dino_{ver}'], models['dino_transform'], device)
-        if any(v is None for v in real_feats.values()): continue
-
-        # 2. Get Text Features
-        txt_feats = {}
-        with torch.no_grad():
-            ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
-            txt_feats['clip'] = models['clip_model'].encode_text(ctk)
-            txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
-
-            # SigLIP Tokenizer Fix
-            try:
-                stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
-            except AttributeError:
-                # Fallback for T5Tokenizer issues in some transformers versions
-                if hasattr(models['siglip_tokenizer'], 'tokenizer'):
-                    # It's the HFTokenizer wrapper
-                    internal_tok = models['siglip_tokenizer'].tokenizer
-                    if hasattr(internal_tok, '__call__'):
-                        res = internal_tok(
-                            [task["prompt"]],
-                            padding='max_length',
-                            truncation=True,
-                            max_length=64,
-                            return_tensors='pt'
-                        )
-                        stk = res['input_ids'].to(device)
-                    else:
-                        raise
-                else:
-                    raise
-
-            txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
-            txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
-
-            # ColQwen3
-            if 'colqwen3_model' in models:
-                try:
-                    processor = models['colqwen3_processor']
-                    model = models['colqwen3_model']
-                    with torch.no_grad():
-                        if hasattr(processor, "process_texts"):
-                            batch_queries = processor.process_texts([task["prompt"]])
-                            batch_queries = {k: v.to(device) for k, v in batch_queries.items()}
-                            query_outputs = model(**batch_queries)
-                            txt_feats['colqwen3'] = query_outputs.embeddings if hasattr(query_outputs, 'embeddings') else query_outputs
-                        else:
-                            inputs = processor(text=[task["prompt"]], return_tensors="pt", padding=True).to(device)
-                            out = model(**inputs)
-                            txt_feats['colqwen3'] = out.embeddings if hasattr(out, 'embeddings') else out.last_hidden_state
-                except Exception as e:
-                    print(f"Error encoding text for ColQwen3: {e}")
-
-        # 3. Update KID & FID (Real) - Update ALL KID/FID models with real data
-        kp = random.sample(real_paths, min(len(real_paths), 20))
-        kimgs = []
-        for p in kp:
-            try: kimgs.append(models['kid_transform'](Image.open(p).convert("RGB")))
-            except: pass
-
-        if kimgs:
-            kt = torch.stack(kimgs).to(device)
-            
-            for m in METHODS.keys():
-                try:
-                    models['kid'][m].update(kt, real=True)
-                    models['fid'][m].update(kt, real=True)
-                except Exception as e:
-                    print(f"Warning: KID/FID update failed for {m} (real): {e}")
-
-        # 4. Evaluate Each Method
-        for method_name, dir_path in METHODS.items():
-            img_path = task_img_paths.get(method_name)
-
-            if not img_path:
+    for method_name, dir_path in METHODS.items():
+        log_file = os.path.join(dir_path, "logs", "evaluation_metrics.txt")
+        if os.path.exists(log_file):
+            metrics = parse_log_file(log_file)
+            if metrics:
+                print(f"  [Cached] Found logs for {method_name}")
+                cached_results[method_name] = metrics
                 continue
+        methods_to_evaluate.append(method_name)
 
-            # Eval Single Image Metrics
-            res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+    if not methods_to_evaluate:
+        print("\nAll methods have cached results. Skipping evaluation loop.")
+    else:
+        print(f"\nMethods to evaluate: {methods_to_evaluate}")
+
+    # 3. Evaluation Loop (Only if needed)
+    results = {}
+    models = {}
+
+    if methods_to_evaluate:
+        # Pre-scan only if running eval
+        print(f"\nScanning generated images for {len(tasks)} tasks...")
+        counts = {m: 0 for m in methods_to_evaluate}
+        for task in tasks:
+            for method_name in methods_to_evaluate:
+                dir_path = METHODS[method_name]
+                if get_best_image_path(method_name, dir_path, task['safe_filename_prefix']):
+                    counts[method_name] += 1
+        
+        print(f"  Evaluated Images Count (Total Tasks: {len(tasks)}):")
+        for m in methods_to_evaluate:
+            print(f"    - {m:<15}: {counts[m]}")
+        print("-" * 80)
+
+        models = load_models(device)
+        
+        # Init results
+        results = {m: [] for m in methods_to_evaluate}
+        results["GroundTruth"] = []
+
+        print(f"\nStarting evaluation on {len(tasks)} Aircraft classes...")
+
+        for task in tqdm(tasks):
+            # [Optimization] Pre-check if any generated image exists for methods to evaluate
+            task_img_paths = {}
+            for method_name in methods_to_evaluate:
+                dir_path = METHODS[method_name]
+                p = get_best_image_path(method_name, dir_path, task['safe_filename_prefix'])
+                if p:
+                    task_img_paths[method_name] = p
             
-            # Eval Pairwise MS-SSIM (Diversity)
-            # Find group images
-            group_imgs = get_group_images(dir_path, task['safe_filename_prefix'])
-            ms_ssim_val = calculate_pairwise_ms_ssim(group_imgs, models['ms_ssim'], models['ssim_transform'], device)
-            if ms_ssim_val is not None:
-                res['ms_ssim'] = ms_ssim_val
+            # GroundTruth always needs real paths
+            real_paths = task["real_image_paths"]
+            if not real_paths: continue
 
-            if res:
-                results[method_name].append(res)
+            # 1. Get Real Features
+            real_feats = {}
+            # V3
+            if 'dino_v3' in models:
+                real_feats['v3'] = get_dino_features_batch(real_paths, models['dino_v3'], models['dino_transform'], device)
+            else:
+                real_feats['v3'] = None
+                
+            real_feats['v2'] = get_dino_features_batch(real_paths, models['dino_v2'], models['dino_transform'], device)
+            real_feats['v1'] = get_dino_features_batch(real_paths, models['dino_v1'], models['dino_transform'], device)
+
+            if any(v is None for k,v in real_feats.items() if k != 'v3'): 
+                continue 
+
+            # 2. Get Text Features
+            txt_feats = {}
+            with torch.no_grad():
+                if models.get('clip_tokenizer'):
+                    ctk = models['clip_tokenizer']([task["prompt"]]).to(device)
+                    txt_feats['clip'] = models['clip_model'].encode_text(ctk)
+                    txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
+
+                # SigLIP
+                if models.get('siglip_tokenizer'):
+                    try:
+                        stk = models['siglip_tokenizer']([task["prompt"]]).to(device)
+                    except AttributeError:
+                        if hasattr(models['siglip_tokenizer'], 'tokenizer'):
+                            internal_tok = models['siglip_tokenizer'].tokenizer
+                            if hasattr(internal_tok, '__call__'):
+                                res = internal_tok([task["prompt"]], padding='max_length', truncation=True, max_length=64, return_tensors='pt')
+                                stk = res['input_ids'].to(device)
+                            else: stk = None
+                        else: stk = None
+
+                    if stk is not None:
+                        txt_feats['siglip'] = models['siglip_model'].encode_text(stk)
+                        txt_feats['siglip'] = F.normalize(txt_feats['siglip'], dim=-1)
+
+            # 3. Update KID & FID (Real) with ALL valid real images
+            use_paths = real_paths[:50]
+            for r_path in use_paths:
+                try:
+                    kt = models['kid_transform'](Image.open(r_path).convert("RGB")).unsqueeze(0).to(device)
+                    # Update only for methods being evaluated + GT
+                    for m_key in models['kid'].keys():
+                         if m_key in methods_to_evaluate or m_key == "GroundTruth":
+                            models['kid'][m_key].update(kt, real=True)
+                            models['fid'][m_key].update(kt, real=True)
+                except: pass
+
+            # 4. Evaluate Ground Truth
+            gt_samples = random.sample(real_paths, min(len(real_paths), 3))
+            gt_scores_accum = defaultdict(list)
+
+            for gt_img_path in gt_samples:
+                s_res = evaluate_single(gt_img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+                if s_res:
+                    for k, v in s_res.items():
+                        gt_scores_accum[k].append(v)
+                
+                try:
+                    img_tensor = models['kid_transform'](Image.open(gt_img_path).convert("RGB")).unsqueeze(0).to(device)
+                    models['kid']['GroundTruth'].update(img_tensor, real=False)
+                    models['fid']['GroundTruth'].update(img_tensor, real=False)
+                except: pass
+
+            if gt_scores_accum:
+                gt_final_res = {k: np.mean(v) for k, v in gt_scores_accum.items()}
+                results['GroundTruth'].append(gt_final_res)
+
+            # 5. Evaluate Generated Images
+            for method_name, img_path in task_img_paths.items():
+                s_res = evaluate_single(img_path, real_feats, txt_feats, models, device, prompt=task["prompt"])
+                if s_res:
+                    results[method_name].append(s_res)
+                
                 try:
                     img_tensor = models['kid_transform'](Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
                     models['kid'][method_name].update(img_tensor, real=False)
                     models['fid'][method_name].update(img_tensor, real=False)
-                except Exception as e:
-                    # print(f"Warning: KID/FID update failed for {method_name} (fake): {e}")
-                    pass
+                except: pass
 
     # Report
     print("\n" + "="*120)
     print(f"  EVAL REPORT: Aircraft (TAC + MGR Only)")
     print("="*120)
 
-    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8} | {'MS-SSIM':<8} | {'MaxSim':<8}")
+    print(f"{'Method':<15} | {'CLIP':<8} | {'SigLIP':<8} | {'DINOv3':<8} | {'KID':<8} | {'FID':<8} | {'LapVar':<8}")
     print("-" * 120)
 
-    for method_name in METHODS.keys():
-        lst = results[method_name]
+    # Include GroundTruth in reporting
+    all_methods_ordered = ["GroundTruth"] + list(METHODS.keys())
+
+    for method_name in all_methods_ordered:
+        # 1. Use Cached if available
+        if method_name in cached_results:
+            m = cached_results[method_name]
+            # Use safe get
+            c_s = m.get('clip', 0)
+            s_s = m.get('siglip', 0)
+            d3 = m.get('dino_v3', 0)
+            kv = m.get('kid', 0)
+            fv = m.get('fid', 0)
+            lv = m.get('lap_var', 0)
+            cached_suffix = " (Cached)"
+            print(f"{method_name:<15} | {c_s:.4f}   | {s_s:.4f}   | {d3:.4f}   | {kv:.5f} | {fv:.4f} | {lv:.1f}{cached_suffix}")
+            continue
+        
+        # 2. Results from current run
+        lst = results.get(method_name, [])
         if not lst:
-            print(f"{method_name:<15} | N/A")
+            if method_name in methods_to_evaluate or method_name == "GroundTruth":
+                 print(f"{method_name:<15} | N/A")
             continue
 
-        # Compute KID & FID
         try:
             kid_score, _ = models['kid'][method_name].compute()
             kid_val = kid_score.item()
         except: kid_val = 0.0
-        
+
         try:
             fid_val = models['fid'][method_name].compute().item()
         except: fid_val = 0.0
 
         clip_s = np.mean([x['clip'] for x in lst])
         siglip_s = np.mean([x['siglip'] for x in lst])
-        d3 = np.mean([x['dinov3_base'] for x in lst])
-        cq3 = np.mean([x.get('colqwen3_maxsim', 0) for x in lst])
-        lap_var = np.mean([x.get('laplacian_var', 0) for x in lst])
         
-        # MS-SSIM (Filter None)
-        ssim_vals = [x.get('ms_ssim') for x in lst if x.get('ms_ssim') is not None]
-        ms_ssim = np.mean(ssim_vals) if ssim_vals else 0.0
+        if len(lst) > 0:
+            if 'dino_v3_base' in lst[0]:
+                d3 = np.mean([x['dino_v3_base'] for x in lst])
+            else:
+                d3 = np.mean([x.get('dinov3_base', 0) for x in lst])
+        else: d3 = 0.0
 
-        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}    | {ms_ssim:.4f}   | {cq3:.4f}")
+        lap_var = np.mean([x.get('laplacian_var', 0) for x in lst])
+
+        print(f"{method_name:<15} | {clip_s:.4f}   | {siglip_s:.4f}   | {d3:.4f}   | {kid_val:.5f} | {fid_val:.4f} | {lap_var:.1f}")
+
+        # Save to logs
+        if method_name in METHODS:
+            try:
+                dir_path = METHODS[method_name]
+                log_dir = os.path.join(dir_path, "logs")
+                os.makedirs(log_dir, exist_ok=True)
+                log_file = os.path.join(log_dir, "evaluation_metrics.txt")
+                
+                with open(log_file, "w") as f:
+                    f.write(f"Evaluation Metrics for {method_name}\n")
+                    f.write("="*50 + "\n")
+                    f.write(f"CLIP Score: {clip_s:.4f}\n")
+                    f.write(f"SigLIP Score: {siglip_s:.4f}\n")
+                    f.write(f"DINO v3 Score: {d3:.4f}\n")
+                    f.write(f"KID Score: {kid_val:.5f}\n")
+                    f.write(f"FID Score: {fid_val:.4f}\n")
+                    f.write(f"Laplacian Variance: {lap_var:.1f}\n")
+            except Exception as e:
+                print(f"  -> Failed to save logs for {method_name}: {e}")
 
     print("="*120)
 

@@ -16,6 +16,8 @@ Usage:
       --openai_api_key "sk-..." \
       --seed 42
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
@@ -36,8 +38,12 @@ parser.add_argument("--total_chunks", type=int, default=1)
 parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
 parser.add_argument("--transformer_lora_path", type=str, default=None)
-parser.add_argument("--openai_api_key", type=str, required=True)
+parser.add_argument("--openai_api_key", type=str, required=False, help="Required for SiliconFlow API. If not provided, uses local model weights.")
 parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct") # Default for SiliconFlow
+
+# Local Weights Config
+parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
+parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
 
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--max_retries", type=int, default=3)
@@ -63,6 +69,13 @@ from tqdm import tqdm
 import openai
 import clip
 
+from rag_utils import (
+    ResourceMonitor,
+    UsageTrackingClient,
+    LocalQwen3VLWrapper,
+    RUN_STATS
+)
+
 # ------------------------------------------------------------------
 from binary_critic import retrieval_caption_generation  # Critic
 from memory_guided_retrieval import retrieve_img_per_caption
@@ -78,14 +91,27 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_BC_MGR_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_BC_MGR_Aircraft_{run_time}"
 }
 
 def setup_system():
+    # Start Resource Monitor
+    monitor = ResourceMonitor(interval=1)
+    monitor.start()
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.append(os.path.abspath(os.path.join(script_dir, args.omnigen2_path)))
 
@@ -99,10 +125,21 @@ def setup_system():
         if not hasattr(pipe.transformer, "enable_teacache"):
             pipe.transformer.enable_teacache = False
         pipe.vae.enable_tiling()
-        pipe.vae.enable_slicing()
-        pipe.to("cuda")
-    except ImportError as e:
-        print(f"Error: OmniGen2 not found. Details: {e}")
+
+    print("Initializing Client...")
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
+        print(f"  Using Local Model Weights from {args.local_model_weight_path}")
+        client = LocalQwen3VLWrapper(args.local_model_weight_path, device_map="auto")
+        # Override llm_model arg to avoid confusion
+        args.llm_model = "local-qwen3-vl"
+    else:
+        print("  Using SiliconFlow API...")
+        client = openai.OpenAI(
+            api_key=args.openai_api_key,
+            base_url="https://api.siliconflow.cn/v1/"
+        )
+   print(f"Error: OmniGen2 not found. Details: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -110,7 +147,8 @@ def setup_system():
         api_key=args.openai_api_key,
         base_url="https://api.siliconflow.cn/v1/"
     )
-    return pipe, client
+    client = UsageTrackingClient(client)
+    return pipe, client, monitor
 
 def load_retrieval_db():
     print(f"Loading Retrieval DBs: {args.retrieval_datasets}...")
@@ -229,7 +267,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Warning during embedding caching: {e}")
 
-    pipe, client = setup_system()
+    pipe, client, monitor = setup_system()
     # retrieval_db = load_retrieval_db() # Already loaded
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
@@ -326,7 +364,7 @@ if __name__ == "__main__":
             # [Token Length Check]
             from memory_guided_retrieval import check_token_length
             # Force Class Name injection
-            query_text = f"{class_name} {class_name}. {prompt}"
+            query_text = f"{class_name}. {prompt}"
             check_token_length([query_text], device="cpu", method=args.retrieval_method)
 
             retrieved_lists, _ = retrieve_img_per_caption(
@@ -390,5 +428,15 @@ if __name__ == "__main__":
 
     end_time = time.time()
     elapsed_time = end_time - start_time
+
+    # Stop Monitor
+    monitor.stop()
+    monitor.save_plots(os.path.join(DATASET_CONFIG['output_path'], "resource_usage.png"))
+
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")

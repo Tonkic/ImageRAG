@@ -7,8 +7,245 @@ from PIL import Image
 import numpy as np
 from transformers import AutoModel, AutoProcessor
 
+# [Hybrid Retrieval]
+from rank_bm25 import BM25Okapi
+import re
+
+class HybridRetriever:
+    def __init__(self, image_paths):
+        """
+        初始化混合检索器
+        :param image_paths: 所有候选图片的完整路径列表
+        """
+        self.image_paths = image_paths
+
+        # 1. 构建语料库 (Corpus Construction)
+        # 从文件名中提取关键信息作为 BM25 的文档
+        # 例如: "datasets/images/Boeing_707-320.jpg" -> "Boeing 707 320"
+        self.corpus_text = [self._clean_filename(p) for p in image_paths]
+
+        # 2. 分词 (Tokenization)
+        self.tokenized_corpus = [doc.split() for doc in self.corpus_text]
+
+        # 3. 建立索引 (Index Building)
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        print(f"BM25 Index built for {len(image_paths)} images.")
+
+    def _clean_filename(self, path):
+        """辅助函数：从路径清洗出纯文本"""
+        basename = os.path.basename(path)
+        name_no_ext = os.path.splitext(basename)[0]
+        # 将下划线、连字符替换为空格，只保留字母数字
+        clean_name = re.sub(r"[^a-zA-Z0-9]", " ", name_no_ext)
+        return clean_name.lower()
+
+    def normalize_scores(self, scores):
+        """
+        Min-Max 归一化，将分数映射到 [0, 1] 区间
+        """
+        scores = np.array(scores)
+        if scores.size == 0:
+            return scores
+
+        min_val = np.min(scores)
+        max_val = np.max(scores)
+
+        # 避免除以零
+        if max_val - min_val == 0:
+            return np.zeros_like(scores)
+
+        return (scores - min_val) / (max_val - min_val)
+
+    def hybrid_search(self, query_text, vector_scores, alpha=0.7):
+        """
+        执行混合检索
+        :param query_text: 文本查询词 (string)
+        :param vector_scores: 对应的向量检索分数 (numpy array, shape=[N])
+        :param alpha: 向量分数的权重 (0.0 - 1.0)，BM25 权重为 1-alpha
+        :return: 融合后的分数 (numpy array)
+        """
+        # 1. 计算 BM25 分数 (Sparse Score)
+        tokenized_query = self._clean_filename(query_text).split()
+        bm25_raw_scores = self.bm25.get_scores(tokenized_query)
+
+        # 2. 归一化 (Normalization) - 关键步骤！
+        # 必须把两者都拉伸到 0-1 之间才能加权
+        norm_vector_scores = self.normalize_scores(vector_scores)
+        norm_bm25_scores = self.normalize_scores(bm25_raw_scores)
+
+        # 3. 加权融合 (Weighted Sum)
+        final_scores = (alpha * norm_vector_scores) + ((1 - alpha) * norm_bm25_scores)
+
+        return final_scores
+
+GLOBAL_BM25_RETRIEVER = None
+
 # [Optional] Long-CLIP Imports
 import sys
+from pic2word import IM2TEXT, encode_text_with_token
+
+GLOBAL_MAPPER = None
+
+def load_mapper(path, embed_dim, device):
+    global GLOBAL_MAPPER
+    if GLOBAL_MAPPER is None:
+        if not os.path.exists(path):
+            print(f"Warning: Pic2Word mapper not found at {path}")
+            return None
+        model = IM2TEXT(embed_dim=embed_dim, output_dim=embed_dim).to(device)
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.eval()
+        GLOBAL_MAPPER = model
+    return GLOBAL_MAPPER
+
+def retrieve_composed(ref_image_path, modifier_text, image_paths, embeddings_path,
+                      mapper_path="pic2word_mapper_ep9.pt", k=1, device='cuda', bs=1024, method="CLIP"):
+    """
+    组合检索: 图片 + 修改文字 -> 目标图片
+    Supports: CLIP, LongCLIP
+    """
+    # 1. 准备模型 (根据 method 加载)
+    model = None
+    preprocess = None
+    mapper = None
+
+    if method == "LongCLIP":
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Long-CLIP'))
+        from model import longclip
+        # Checkpoint path
+        ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Long-CLIP/checkpoints/longclip-L.pt')
+        if not os.path.exists(ckpt_path):
+             print(f"Long-CLIP checkpoint missing at {ckpt_path}")
+             return [], []
+        model, preprocess = longclip.load(ckpt_path, device=device)
+        model.eval()
+
+        # Determine dim
+        # Long-CLIP-L visual output dim is 768
+        embed_dim = model.visual.output_dim
+
+    else:
+        # Default CLIP
+        import clip
+        model, preprocess = clip.load("ViT-L/14", device=device)
+        embed_dim = model.visual.output_dim
+
+
+    mapper = load_mapper(mapper_path, embed_dim, device)
+
+    if mapper is None:
+        print("Pic2Word Mapper not loaded. Returning empty.")
+        return [], []
+
+    # 2. 处理参考图 (Visual Anchor)
+    try:
+        image = preprocess(Image.open(ref_image_path).convert("RGB")).unsqueeze(0).to(device)
+    except Exception as e:
+        print(f"Error loading ref image {ref_image_path}: {e}")
+        return [], []
+
+    with torch.no_grad():
+        img_feat = model.encode_image(image)
+        img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+        # 映射为 Token
+        pseudo_token = mapper(img_feat) # [1, Dim]
+
+    # 3. 构造组合 Prompt
+    # 格式: "A photo of *, {modifier}"
+    prompt = f"A photo of *, {modifier_text}"
+
+    star_token_id = 0 # default
+    text_tokens = None
+
+    if method == "LongCLIP":
+        from model import longclip # ensure import
+        # LongCLIP tokenizer
+        text_tokens = longclip.tokenize([prompt]).to(device)
+        star_token_id = longclip.tokenize(["*"])[0][1]
+    else:
+        import clip
+        text_tokens = clip.tokenize([prompt]).to(device)
+        star_token_id = clip.tokenize(["*"])[0][1]
+
+    # 4. 编码组合 Query
+    # encode_text_with_token handles LongCLIP check inside now
+    with torch.no_grad():
+        query_emb = encode_text_with_token(model, text_tokens, pseudo_token, star_token_id)
+        normalized_text_vectors = query_emb / query_emb.norm(dim=-1, keepdim=True)
+
+    # 5. 检索
+    all_scores = []
+    all_paths = []
+
+    embedding_cache_prefix = "longclip_embeddings" if method == "LongCLIP" else "clip_embeddings"
+
+    with torch.no_grad():
+        for bi in range(0, len(image_paths), bs):
+            cache_file = os.path.join(embeddings_path, f"{embedding_cache_prefix}_b{bi}.pt")
+            current_batch_paths = image_paths[bi : bi + bs]
+
+            normalized_im_vectors = None
+            if os.path.exists(cache_file):
+                try:
+                    data = torch.load(cache_file, map_location=device, weights_only=False)
+
+                    normalized_im_vectors = data['normalized_clip_embeddings']
+                    final_bi_paths = data.get('paths', current_batch_paths)
+                except: pass
+
+            # Note: Assuming Embeddings are ViT-B/32 in standard flow, wait.
+            # Pic2Word usually uses ViT-L/14. If the database was encoded with ViT-B/32, this WONT WORK.
+            # The user must ensure "clip_embeddings" are compatible or re-compute.
+            # However, the user request says: "assume you have loaded .pt ... same as your retrieval model".
+            # If the user script uses ViT-L/14 for retrieval, then embeddings are L/14.
+            # But earlier in file: model, preprocess = clip.load("ViT-B/32", device=device)
+            pass
+
+            # Since we can't guarantee embeddings are L/14, we might need to re-encode if we want to be safe,
+            # Or assume the user handles it.
+            # Given the context, I should probably Re-encode if cache is B/32?
+            # For simplicity, I will re-implement the loop to load images and encode with current L/14 model.
+
+            # ACTUALLY: The user's prompt step 2 training uses "ViT-L/14".
+            # The retrieval DB probably uses B/32 by default in the script.
+            # Conflict!
+            # I should calculate embeddings on the fly if I can't trust cache.
+            # Or better, just implement the loop to encode images using the L/14 model.
+
+            images = []
+            valid_paths = []
+            for path in current_batch_paths:
+                try:
+                    img_pil = Image.open(path).convert("RGB")
+                    images.append(preprocess(img_pil).unsqueeze(0).to(device))
+                    valid_paths.append(path)
+                except: continue
+
+            if not images: continue
+
+            images = torch.cat(images, dim=0)
+            image_features = model.encode_image(images)
+            normalized_im_vectors = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            sim_matrix = torch.matmul(normalized_text_vectors, normalized_im_vectors.T)
+            all_scores.append(sim_matrix.cpu().numpy())
+            all_paths.extend(valid_paths)
+
+    if not all_scores:
+        return [], []
+
+    full_scores = np.concatenate(all_scores, axis=1)
+    single_prompt_scores = full_scores[0] # [N]
+
+    k = min(k, len(single_prompt_scores))
+    top_indices = np.argsort(single_prompt_scores)[-k:][::-1]
+
+    top_paths = [all_paths[i] for i in top_indices]
+    top_scores = single_prompt_scores[top_indices].tolist()
+
+    return top_paths, top_scores
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Long-CLIP'))
 try:
     from model import longclip
@@ -60,7 +297,7 @@ def check_token_length(prompts, device="cpu", method="CLIP"):
 
     # ... (Re-implementing loop logic correctly in the tool call)
 
-def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0'):
+def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0', use_hybrid=False):
     """
     CLIP 检索核心逻辑 (支持长文本 Chunking)
     """
@@ -132,11 +369,27 @@ def get_clip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=5
     full_scores = np.concatenate(all_scores, axis=1)
     single_prompt_scores = full_scores[0]
 
-    k = min(k, len(single_prompt_scores))
-    top_indices = np.argsort(single_prompt_scores)[-k:][::-1]
+    # [Hybrid Retrieval]
+    if use_hybrid:
+        global GLOBAL_BM25_RETRIEVER
+        if GLOBAL_BM25_RETRIEVER is None or len(GLOBAL_BM25_RETRIEVER.image_paths) != len(all_paths):
+            print(f"Initializing HybridRetriever with {len(all_paths)} images...")
+            GLOBAL_BM25_RETRIEVER = HybridRetriever(all_paths)
+
+        # Hybrid Search (0.7 Vector + 0.3 BM25)
+        final_scores = GLOBAL_BM25_RETRIEVER.hybrid_search(
+            query_text=prompts[0],
+            vector_scores=single_prompt_scores,
+            alpha=0.7
+        )
+    else:
+        final_scores = single_prompt_scores
+
+    k = min(k, len(final_scores))
+    top_indices = np.argsort(final_scores)[-k:][::-1]
 
     top_paths = [all_paths[i] for i in top_indices]
-    top_scores = single_prompt_scores[top_indices].tolist()
+    top_scores = final_scores[top_indices].tolist()
 
     return top_paths, top_scores
 
@@ -364,7 +617,6 @@ class GlobalMemory:
         return [], []
 
 
-# Removed ColQwen3 retrieval function as requested
 
 def get_bge_vl_similarities(prompts, image_paths, embeddings_path="", bs=32, k=50, device='cuda:0', save=False):
     """
@@ -708,35 +960,41 @@ def get_qwen2_5_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, 
 
     return final_paths_list, final_scores_list
 
-def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=50, device='cuda:0', save=False, adapter_path=None):
+def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=50, device='cuda:0', save=False, adapter_path=None, external_model=None, external_processor=None):
     """
     Qwen3-VL Retrieval
     """
     try:
         from transformers import AutoProcessor, AutoModelForVision2Seq
-        # Use local path
-        model_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
 
-        print(f"Loading Qwen3-VL from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            trust_remote_code=True
-        )
+        if external_model is not None and external_processor is not None:
+            print("Using shared external Qwen3-VL model for retrieval...")
+            model = external_model
+            processor = external_processor
+        else:
+            # Use local path
+            model_name = "/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct"
 
-        if adapter_path:
-            try:
-                from peft import PeftModel
-                print(f"Loading LoRA adapter from {adapter_path}...")
-                model = PeftModel.from_pretrained(model, adapter_path)
-            except ImportError:
-                print("Warning: peft not installed, cannot load adapter.")
-            except Exception as e:
-                print(f"Error loading adapter: {e}")
+            print(f"Loading Qwen3-VL from {model_name}...")
+            processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device,
+                trust_remote_code=True
+            )
 
-        model.eval()
+            if adapter_path:
+                try:
+                    from peft import PeftModel
+                    print(f"Loading LoRA adapter from {adapter_path}...")
+                    model = PeftModel.from_pretrained(model, adapter_path)
+                except ImportError:
+                    print("Warning: peft not installed, cannot load adapter.")
+                except Exception as e:
+                    print(f"Error loading adapter: {e}")
+
+            model.eval()
     except Exception as e:
         print(f"Error loading Qwen3-VL: {e}")
         return [], []
@@ -793,9 +1051,15 @@ def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=
             if os.path.exists(cache_file):
                 try:
                     data = torch.load(cache_file, map_location=device, weights_only=False)
-                    batch_doc_embeddings = data['embeddings']
-                    final_bi_paths = data.get('paths', current_batch_paths)
-                except: pass
+                    cached_emb = data['embeddings']
+                    # Dimension Check
+                    if cached_emb.shape[-1] == query_embeddings.shape[-1]:
+                        batch_doc_embeddings = cached_emb
+                        final_bi_paths = data.get('paths', current_batch_paths)
+                    else:
+                        print(f"Warning: Cached embeddings in {cache_file} have dimension {cached_emb.shape[-1]}, but model has {query_embeddings.shape[-1]}. Ignoring cache.")
+                except Exception as e:
+                    print(f"Error loading cache {cache_file}: {e}")
 
             if batch_doc_embeddings is None and save:
                 images = []
@@ -871,7 +1135,7 @@ def get_qwen3_vl_similarities(prompts, image_paths, embeddings_path="", bs=1, k=
 
     return final_paths_list, final_scores_list
 
-def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None, adapter_path=None):
+def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, device='cuda', method='CLIP', global_memory=None, adapter_path=None, use_hybrid=False, external_model=None, external_processor=None):
     """
     统一检索入口。
     支持 global_memory: 用于 Re-ranking (Penalize history)
@@ -884,7 +1148,8 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
             paths, scores = get_clip_similarities(
                 [caption], image_paths,
                 embeddings_path=embeddings_path,
-                k=k, device=device
+                k=k, device=device,
+                use_hybrid=use_hybrid
             )
 
             if global_memory:
@@ -954,7 +1219,9 @@ def retrieve_img_per_caption(captions, image_paths, embeddings_path="", k=3, dev
                 [caption], image_paths,
                 embeddings_path=embeddings_path,
                 k=k, device=device, save=True,
-                adapter_path=adapter_path
+                adapter_path=adapter_path,
+                external_model=external_model if external_model else (getattr(global_memory, 'model', None) if global_memory else None),
+                external_processor=external_processor if external_processor else (getattr(global_memory, 'processor', None) if global_memory else None)
             )
             if paths_list:
                 paths = paths_list[0]
@@ -1042,7 +1309,8 @@ def get_longclip_similarities(prompts, image_paths, embeddings_path="", bs=1024,
 
             if os.path.exists(cache_file):
                 data = torch.load(cache_file, map_location=device, weights_only=False)
-                normalized_im_vectors = data['normalized_clip_embeddings']
+                # Support both keys for backward compatibility
+                normalized_im_vectors = data.get('normalized_longclip_embeddings', data.get('normalized_clip_embeddings'))
                 final_bi_paths = data.get('paths', current_batch_paths)
             else:
                 images = []
@@ -1067,7 +1335,7 @@ def get_longclip_similarities(prompts, image_paths, embeddings_path="", bs=1024,
                 if embeddings_path:
                     os.makedirs(embeddings_path, exist_ok=True)
                     torch.save({
-                        "normalized_clip_embeddings": normalized_im_vectors,
+                        "normalized_longclip_embeddings": normalized_im_vectors,
                         "paths": final_bi_paths
                     }, cache_file)
 

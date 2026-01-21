@@ -16,6 +16,8 @@ Usage:
       --openai_api_key "sk-..." \
       --seed 42
 '''
+from datetime import datetime
+
 
 import argparse
 import sys
@@ -34,8 +36,12 @@ parser.add_argument("--total_chunks", type=int, default=1)
 parser.add_argument("--omnigen2_path", type=str, default="./OmniGen2")
 parser.add_argument("--omnigen2_model_path", type=str, default="OmniGen2/OmniGen2")
 parser.add_argument("--transformer_lora_path", type=str, default=None)
-parser.add_argument("--openai_api_key", type=str, required=True)
+parser.add_argument("--openai_api_key", type=str, required=False, help="Required for SiliconFlow API. If not provided, uses local model weights.")
 parser.add_argument("--llm_model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct")
+
+# Local Weights Config
+parser.add_argument("--use_local_model_weight", action="store_true", help="Load local model weights directly (transformers)")
+parser.add_argument("--local_model_weight_path", type=str, default="/home/tingyu/imageRAG/Qwen3-VL-4B-Instruct")
 
 # 生成参数
 parser.add_argument("--seed", type=int, default=0, help="全局随机种子")
@@ -51,15 +57,28 @@ args = parser.parse_args()
 
 # 环境设置
 if args.retrieval_device_id is not None and args.retrieval_device_id != args.device_id:
+    # 场景 A: 双 GPU 模式 (例如 device_id=2, retrieval=3)
+    # CUDA_VISIBLE_DEVICES="2,3"
+    # 内部视角: cuda:0 -> 物理GPU 2 (OmniGen), cuda:1 -> 物理GPU 3 (Retrieval)
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.device_id},{args.retrieval_device_id}"
     omnigen_device = "cuda:0"
     retrieval_device = "cuda:1"
     print(f"DEBUG: 使用多 GPU。OmniGen 在 GPU {args.device_id} (内部 cuda:0)，检索在 GPU {args.retrieval_device_id} (内部 cuda:1)")
+
+    # [Fix] Import Torch AFTER setting environment variables
+    import torch
+
 else:
+    # 场景 B: 单 GPU 模式
+    # CUDA_VISIBLE_DEVICES="2"
+    # 内部视角: cuda:0 -> 物理GPU 2
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
     omnigen_device = "cuda:0"
     retrieval_device = "cuda:0"
     print(f"DEBUG: 在设备 {args.device_id} 上使用单 GPU")
+
+    # [Fix] Import Torch AFTER setting environment variables
+    import torch
 
 print(f"DEBUG: CUDA_VISIBLE_DEVICES 设置为 {os.environ['CUDA_VISIBLE_DEVICES']}")
 
@@ -78,6 +97,7 @@ import clip
 from taxonomy_aware_critic import taxonomy_aware_diagnosis # TAC 逻辑
 from memory_guided_retrieval import retrieve_img_per_caption
 from global_memory import GlobalMemory # MGR 逻辑
+from rag_utils import ResourceMonitor, RUN_STATS, UsageTrackingClient, LocalQwen3VLWrapper
 
 # --- 2. 复现性 (固定种子) ---
 def seed_everything(seed):
@@ -90,15 +110,24 @@ def seed_everything(seed):
     print(f"[System] 全局种子设置为: {seed}")
 
 # --- 3. 配置 ---
+
+dt = datetime.now()
+timestamp = dt.strftime("%Y.%-m.%-d")
+run_time = dt.strftime("%H-%M-%S")
+try:
+    _rm = args.retrieval_method
+except:
+    _rm = "default"
+
 DATASET_CONFIG = {
     "classes_txt": "datasets/fgvc-aircraft-2013b/data/variants.txt",
     "train_list": "datasets/fgvc-aircraft-2013b/data/images_train.txt",
     "image_root": "datasets/fgvc-aircraft-2013b/data/images",
-    "output_path": "results/OmniGenV2_TAC_MGR_Aircraft"
+    "output_path": f"results/{_rm}/{timestamp}/OmniGenV2_TAC_MGR_Aircraft_{run_time}"
 }
 
 # --- 4. 系统设置 ---
-def setup_system():
+def setup_system(shared_model=None, shared_processor=None):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.append(os.path.abspath(os.path.join(script_dir, args.omnigen2_path)))
 
@@ -110,11 +139,15 @@ def setup_system():
             trust_remote_code=True,
         )
         # 修复 AttributeError
-        if not hasattr(pipe.transformer, "enable_teacache"):
-            pipe.transformer.enable_teacache = False
+        # 开启 TeaCache (用户请求)
+        pipe.transformer.enable_teacache = True
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
-        pipe.to("cuda")
+
+        # [Fix] OOM: Use enable_model_cpu_offload if configured, else specific device
+        # pipe.to("cuda") # Original causing confusion with multiple GPUs
+        pipe.to(omnigen_device)
+
     except ImportError as e:
         print(f"错误: 未找到 OmniGen2。详情: {e}")
         import traceback
@@ -122,10 +155,28 @@ def setup_system():
         sys.exit(1)
 
 
-    client = openai.OpenAI(
-        api_key=args.openai_api_key,
-        base_url="https://api.siliconflow.cn/v1/"
-    )
+    print("Initializing Client...")
+    # [优化] 尝试共享 GlobalMemory 已加载的 Qwen3 模型 (如果存在)
+
+    # Logic: Missing API Key -> Use Local Weights
+    if not args.openai_api_key:
+        print(f"  Using Local Model Weights from {args.local_model_weight_path}")
+        # Pass shared_model and shared_processor if available
+        client = LocalQwen3VLWrapper(
+            args.local_model_weight_path,
+            device_map=retrieval_device,
+            shared_model=shared_model,
+            shared_processor=shared_processor
+        )
+        # Override llm_model arg to avoid confusion
+        args.llm_model = "local-qwen3-vl"
+    else:
+        print("  Using SiliconFlow API...")
+        client = openai.OpenAI(
+            api_key=args.openai_api_key,
+            base_url="https://api.siliconflow.cn/v1/"
+        )
+    client = UsageTrackingClient(client)
     return pipe, client
 
 def load_retrieval_db():
@@ -259,13 +310,39 @@ if __name__ == "__main__":
             print("CRITICAL: CUDA Error detected. Exiting to prevent further crashes.")
             sys.exit(1)
 
+    # 2.2 预加载 Qwen3-VL (如果需要且使用本地模型)
+    # 这允许我们在 TAC Client 和 GlobalMemory/Retrieval 之间共享权重
+    shared_qwen_model = None
+    shared_qwen_processor = None
+
+    need_local_qwen = (not args.openai_api_key) or (args.retrieval_method == "Qwen3-VL")
+    if need_local_qwen:
+        print("[System] Pre-loading Shared Qwen3-VL Model to prevent duplication...")
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        model_path = args.local_model_weight_path
+        try:
+             shared_qwen_processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+             shared_qwen_model = AutoModelForVision2Seq.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map=retrieval_device,
+                trust_remote_code=True
+             ).eval()
+             print(f"[System] Shared Qwen3-VL loaded on {retrieval_device}")
+        except Exception as e:
+             print(f"[System] Failed to pre-load Qwen3-VL: {e}")
+
     # 3. 初始化 OmniGen (现在可以安全加载大模型了)
-    pipe, client = setup_system()
+    pipe, client = setup_system(shared_model=shared_qwen_model, shared_processor=shared_qwen_processor)
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
 
     # 创建日志目录
     logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
     os.makedirs(logs_dir, exist_ok=True)
+
+    # Start Resource Monitor
+    monitor = ResourceMonitor(interval=1.0)
+    monitor.start()
 
     # 保存运行配置
     config_path = os.path.join(logs_dir, "run_config.txt")
@@ -320,15 +397,18 @@ if __name__ == "__main__":
 
         # [MGR 核心]: 用于重排序的全局记忆
         # 注意: GlobalMemory 目前仅支持 Qwen2.5-VL/Qwen3-VL 作为特征提取器 (MemoRAG Projector)
-        memory_model_type = "Qwen2.5-VL"
+        memory_model_type = "Qwen3-VL"
         if args.retrieval_method == "Qwen3-VL":
             memory_model_type = "Qwen3-VL"
 
         global_memory = GlobalMemory(
             device=retrieval_device,
             embedding_model=memory_model_type,
-            adapter_path=args.adapter_path
+            adapter_path=args.adapter_path,
+            external_model=shared_qwen_model,
+            external_processor=shared_qwen_processor
         )
+
         last_used_ref = None
 
         # [分数追踪]
@@ -380,20 +460,20 @@ if __name__ == "__main__":
 
             if args.retrieval_method in ["CLIP", "SigLIP", "SigLIP2"]:
                  # 使用 LLM 生成的简明提示以避免 Token 溢出
-                 query_text = diagnosis.get('concise_retrieval_prompt', f"{class_name} {class_name}")
+                 query_text = diagnosis.get('concise_retrieval_prompt', f"{class_name}")
                  # 如果 LLM 没有返回，则使用回退方案
                  if not query_text or len(query_text) < 5:
-                     query_text = f"{class_name} {class_name}"
-            elif args.retrieval_method in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL"]:
-                 # BGE-VL/Qwen2.5-VL/Qwen3-VL: 使用完整的 prompt，不进行截断
+                     query_text = f"{class_name}"
+            elif args.retrieval_method in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL", "LongCLIP"]:
+                 # BGE-VL/Qwen2.5-VL/Qwen3-VL/LongCLIP: 使用完整的 prompt，不进行截断
                  query_text = f"{refined_prompt} " + " ".join(mgr_queries)
             else:
                  # 强制注入类别名称以用于长上下文模型
-                 query_text = f"{class_name} {class_name}. " + " ".join(mgr_queries)
+                 query_text = f"{class_name}. " + " ".join(mgr_queries)
                  if len(query_text) > 300: query_text = query_text[:300]
 
             # [Token 长度检查]
-            if args.retrieval_method not in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL"]:
+            if args.retrieval_method not in ["BGE-VL", "Qwen2.5-VL", "Qwen3-VL", "LongCLIP"]:
                 from memory_guided_retrieval import check_token_length
                 check_token_length([query_text], device="cpu", method=args.retrieval_method)
 
@@ -480,7 +560,7 @@ if __name__ == "__main__":
         # 重新初始化以确保状态干净，并加载所有累积的记忆
         trainer_memory = GlobalMemory(
             device=retrieval_device,
-            embedding_model="Qwen2.5-VL",
+            embedding_model="Qwen3-VL",
             adapter_path=args.adapter_path
         )
         trainer_memory.memory = all_feedback_memory # 注入收集到的记忆
@@ -489,7 +569,15 @@ if __name__ == "__main__":
         print(f"训练期间出错: {e}")
     print("============================================")
 
+
+    # Stop Monitor and Save Plots
+    monitor.stop()
+    monitor.save_plots(logs_dir)
+    print(f"Resource usage plots saved to {os.path.join(logs_dir, 'resource_usage.png')}")
     end_time = time.time()
     elapsed_time = end_time - start_time
     with open(os.path.join(logs_dir, "time_elapsed.txt"), "w") as f:
         f.write(f"Total execution time: {elapsed_time:.2f} seconds\n")
+        f.write(f"Total Input Tokens: {RUN_STATS['input_tokens']}\n")
+        f.write(f"Total Output Tokens: {RUN_STATS['output_tokens']}\n")
+        f.write(f"Total Tokens: {RUN_STATS['input_tokens'] + RUN_STATS['output_tokens']}\n")
