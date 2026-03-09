@@ -1,0 +1,8 @@
+GroundTruth Baseline Metrics
+==================================================
+CLIP Score: 0.2811
+SigLIP Score: 0.0531
+DINO v3 Score: 0.5670
+FID Score: 22.5097
+Inception Score: 1.5874
+Laplacian Variance: 963.8

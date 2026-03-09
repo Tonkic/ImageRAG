@@ -1,0 +1,54 @@
+--- src/experiments\OmniGenV2_Ablation_noDINO.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noDINO.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noDINO_Aircraft_AR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noDINO_Aircraft_AR.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noInputDecomp.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noInputDecomp.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noInputDecomp_Aircraft_AR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noInputDecomp_Aircraft_AR.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noTAC.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noTAC.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noTAC_Aircraft_AR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noTAC_Aircraft_AR.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noVAR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noVAR.py, line 96)
+
+--- src/experiments\OmniGenV2_Ablation_noVAR_Aircraft_AR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_Ablation_noVAR_Aircraft_AR.py, line 96)
+
+--- src/experiments\OmniGenV2_BC_MGR_Aircraft.py ---
+  File "src/experiments\OmniGenV2_BC_MGR_Aircraft.py", line 129
+    print("Initializing Client...")
+    ^^^^^
+SyntaxError: expected 'except' or 'finally' block
+
+
+--- src/experiments\OmniGenV2_BC_SR_CUB.py ---
+  File "src/experiments\OmniGenV2_BC_SR_CUB.py", line 125
+    Client...")
+             ^
+SyntaxError: unterminated string literal (detected at line 125)
+
+
+--- src/experiments\OmniGenV2_TAC_DINO_Importance_Aircraft.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_TAC_DINO_Importance_Aircraft.py, line 96)
+
+--- src/experiments\OmniGenV2_TAC_DINO_Importance_Aircraft_AR.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_TAC_DINO_Importance_Aircraft_AR.py, line 96)
+
+--- src/experiments\OmniGenV2_TAC_DINO_MaskedInjection_Aircraft.py ---
+Sorry: IndentationError: unexpected indent (OmniGenV2_TAC_DINO_MaskedInjection_Aircraft.py, line 96)
+
+--- src/experiments\OmniGenV2_TAC_noRAG_Aircraft.py ---
+  File "src/experiments\OmniGenV2_TAC_noRAG_Aircraft.py", line 157
+    client = openai.OpenAI(
+                          ^
+SyntaxError: '(' was never closed
+
+
