@@ -56,7 +56,7 @@ datasets/
 | CLIP | `clip_embeddings_b{offset}.pt` | OpenAI CLIP ViT-B/32 |
 | LongCLIP | `longclip_embeddings_b{offset}.pt` | Long-CLIP ViT-L/14 (248 tokens) |
 | SigLIP | `siglip_embeddings_b{offset}.pt` | SigLIP ViT-SO400M-14-SigLIP |
-| SigLIP2 | `siglip2_embeddings_b{offset}.pt` | SigLIP2 base-patch16-224 |
+| SigLIP2 | `siglip2_embeddings_b{offset}.pt` | SigLIP2（aircraft: base-patch16-224 @ 768d；cub/imagenet: so400m-patch16-naflex @ 1152d） |
 | Qwen3-VL | `qwen3_vl_embeddings_b{offset}.pt` | Qwen3-VL-4B 视觉编码器 |
 | Qwen2.5-VL | `qwen_embeddings_b{offset}.pt` | Qwen2.5-VL |
 
@@ -65,7 +65,7 @@ datasets/
 在实验脚本中通过 `--retrieval_datasets` 参数指定包含 `imagenet`：
 
 ```bash
-python OmniGenV2_TAC_DINO_Importance_Aircraft_AR.py \
+python OmniGenV2_TAC_DINO_Importance_Aircraft_AR_slim.py \
     --device_id 0 \
     --retrieval_datasets aircraft imagenet \
     --retrieval_method LongCLIP \
@@ -224,8 +224,20 @@ data = torch.load("clip_embeddings_b0.pt")
 # data = {
 #     "embeddings": tensor,       # [N, D] 特征向量
 #     "image_paths": list,        # [N] 对应图像路径
+#     # SigLIP2 缓存另包含（若用 so400m 预计算）：
+#     # "model_name": "google/siglip2-so400m-patch16-naflex"
 # }
 ```
+
+**SigLIP2 缓存格式说明**：
+
+| 数据集 | 生成模型 | 嵌入维度 | `model_name` 字段 |
+|--------|---------|---------|-----------------|
+| aircraft | `google/siglip2-base-patch16-224` | 768d | 无（旧格式缓存） |
+| cub | `google/siglip2-so400m-patch16-naflex` | 1152d | 有 |
+| imagenet | `google/siglip2-so400m-patch16-naflex` | 1152d | 有 |
+
+> `ImageRetriever` 会自动读取 `model_name` 字段并对齐查询编码器，不同数据集使用不同模型族的缓存可以正常混合使用。
 
 ### 生成嵌入
 

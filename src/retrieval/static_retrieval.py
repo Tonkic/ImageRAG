@@ -17,6 +17,32 @@ except ImportError:
     LONGCLIP_AVAILABLE = False
     print("Warning: Long-CLIP not found.")
 
+
+def get_siglip2_model_id():
+    return os.environ.get("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224")
+
+
+def _unwrap_siglip2_features(features, modality="image"):
+    if isinstance(features, torch.Tensor):
+        return features
+
+    preferred = [f"{modality}_embeds", "pooler_output", "image_embeds", "text_embeds", "last_hidden_state"]
+    for attr in preferred:
+        value = getattr(features, attr, None)
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 3:
+                return value[:, 0, :]
+            return value
+
+    if isinstance(features, (tuple, list)) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor):
+            if first.dim() == 3:
+                return first[:, 0, :]
+            return first
+
+    raise TypeError(f"Unsupported SigLIP2 feature output type: {type(features)}")
+
 # -----------------------------------------------------------------------------
 # Static Retrieval (Baseline)
 # 功能：仅使用预训练模型 (CLIP/SigLIP) 进行基于余弦相似度的 Top-K 检索。
@@ -229,11 +255,11 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
 
 def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0', save=False):
     """
-    SigLIP2 Retrieval (google/siglip2-base-patch16-224)
+    SigLIP2 Retrieval (configurable via SIGLIP2_MODEL_ID env var)
     """
     try:
         from transformers import AutoModel, AutoProcessor
-        model_name = "google/siglip2-base-patch16-224"
+        model_name = get_siglip2_model_id()
         # Use flash_attention_2 if available for efficiency, though not strictly required
         # The user doc mentions attn_implementation="flash_attention_2"
         model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa").to(device).eval()
@@ -257,7 +283,7 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
     all_paths = []
 
     with torch.no_grad():
-        text_features = model.get_text_features(**text_inputs)
+        text_features = _unwrap_siglip2_features(model.get_text_features(**text_inputs), modality="text")
         normalized_text_vectors = F.normalize(text_features, dim=-1)
 
         for bi in range(0, len(image_paths), bs):
@@ -296,7 +322,7 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
 
                 # Process Images
                 image_inputs = processor(images=images, return_tensors="pt").to(device)
-                image_features = model.get_image_features(**image_inputs)
+                image_features = _unwrap_siglip2_features(model.get_image_features(**image_inputs), modality="image")
                 normalized_im_vectors = F.normalize(image_features, dim=-1)
                 final_bi_paths = valid_paths
 

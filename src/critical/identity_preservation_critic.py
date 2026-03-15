@@ -16,7 +16,7 @@ def evaluate_identity_preservation(
     generation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     prompt_text = f"""
-You are a {domain} identity matching judge.
+You are a {domain} identity matching judge. IMPORTANT: Respond in English only.
 
 Image-1 is the retrieved real reference image.
 Image-2 is the generated image.
@@ -30,8 +30,8 @@ Return EXACTLY one JSON object with keys:
 - generated_entity: string
 - same_identity: boolean
 - identity_score: number in [0, 10]
-- mismatch_cues: array of strings
-- summary: string
+- mismatch_cues: array of strings (in English)
+- summary: string (in English)
 
 No markdown. No prose outside JSON.
 """.strip()

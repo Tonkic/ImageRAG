@@ -91,8 +91,8 @@
 | 项目 | 详情 |
 |------|------|
 | **用途** | **MGR (Memory-Guided Retrieval)** 动态检索模块 |
-| **行数** | ~1424 行 |
-| **依赖方** | 所有 `*_MGR_*.py` 和 `*_VAR_*.py` 实验脚本 |
+| **路径** | `src/retrieval/memory_guided_retrieval.py` |
+| **依赖方** | 所有 `*_MGR_*.py`、`*_VAR_*.py` 实验脚本，以及 `OmniGenV2_IPC_AR.py` |
 
 **关键组件**：
 
@@ -104,7 +104,7 @@
 | `get_clip_similarities(...)` | CLIP ViT-B/32 检索（含缓存、混合模式） |
 | `get_longclip_similarities(...)` | Long-CLIP 检索 (248 tokens) |
 | `get_siglip_similarities(...)` | SigLIP 检索 |
-| `get_siglip2_similarities(...)` | SigLIP2 检索 |
+| `get_siglip2_similarities(...)` | SigLIP2 检索（含自动模型对齐，见下） |
 
 **检索方法路由**：
 
@@ -117,15 +117,27 @@
 - 首次检索时自动计算嵌入并存储为 `{method}_embeddings_b{offset}.pt`，后续直接加载。
 - **全局参数级缓存 (Global Model Caching)**：相同 `method` (如 LongCLIP) 会跨实例复用 VRAM 中的模型，仅在首次加载时占用显存，极大地节约了多库混合检索（如 Aircraft + CUB + ImageNet）时的开销。
 
----
+**SigLIP2 自动模型对齐**（已修复）：
+
+SigLIP2 存在两个不兼容的模型族，嵌入维度不同：
+
+| 模型 | 嵌入维度 | 对应数据集缓存 |
+|------|---------|--------------|
+| `google/siglip2-base-patch16-224` | 768d | aircraft（旧缓存，无 `model_name` 元数据） |
+| `google/siglip2-so400m-patch16-naflex` | 1152d | cub、imagenet |
+
+`ImageRetriever` 加载缓存时会读取 `.pt` 文件中的 `model_name` 元数据，若查询编码器与缓存不一致，自动热切换到匹配的模型（`_align_siglip2_model_to_embeddings()`）。混合多数据集（aircraft + cub + imagenet）时会对每个子检索器独立对齐，无需手动指定 `--siglip2_model_id`。
 
 ---
 
-### 4. custom_pipeline.py
+---
+
+### 4. src/utils/custom_pipeline.py
 
 | 项目 | 详情 |
 |------|------|
 | **用途** | OmniGen2 自定义管线（支持多种融合模式） |
+| **路径** | `src/utils/custom_pipeline.py` |
 | **依赖方** | AR 相关的流水线实验脚本 |
 
 **关键类**：
@@ -133,8 +145,20 @@
 | 类 | 说明 |
 |------|------|
 | `CustomOmniGen2Pipeline` | 基础自定义管线：支持预计算 latent 注入 |
+| `CustomOmniGen2DualPathPipeline` | **双路径管线**：当前主实验（IPC-AR）使用，同时支持文本路径和参考图路径 |
 | `CustomOmniGen2DiTLateFusionPipeline` | **晚期融合**：AR 只接收文本，图像通过 VAE latent 直接注入 DiT |
 | `CustomOmniGen2AREarlyFusionPipeline` | **早期融合**：图像被 MLLM 转为 token 影响 Hidden States |
+
+**`decouple_threshold` 参数语义**（已修复）：
+
+| 值 | 含义 |
+|----|------|
+| `0.0` | 全程无参考图引导（纯文本生成） |
+| `1.0` | 全程有参考图引导 |
+| `0.65`（推荐） | 前 65% 推理步有参考图引导，后 35% 逐步解耦 |
+| `0.25`（默认） | 前 25% 推理步有参考图引导 |
+
+> **注意**：`decouple_threshold` 已修复之前的语义反转问题（旧代码中 `0.0` 错误地等同于"全程有参考"）。现在该值表示参考图引导覆盖的推理步比例，超过该比例后逐步解耦参考图。
 
 ---
 
@@ -177,11 +201,18 @@
 --omnigen2_model_path OmniGen2/OmniGen2  # 模型权重路径
 --transformer_lora_path <path>   # LoRA 适配器路径（可选）
 
-# VLM 配置
+# VLM 配置（OmniGenV2_IPC_AR.py）
+--text_api_key <key>             # Step1/Step5 文本 LLM API Key（SiliconFlow 等）
+--text_api_base <url>            # API base URL（可选，默认指向 SiliconFlow）
+--vl_api_key <key>               # Step2 VAR rerank + Step4 IPC 诊断 VLM API Key
+                                 # 不传则 fallback 到本地 Qwen3-VL-4B-Instruct
+--vl_llm_model Qwen/Qwen3-VL-30B-A3B-Instruct  # API VLM 模型名（默认）
+--local_model_weight_path /home/tingyu/imageRAG/Qwen3-VL-4B-Instruct  # 本地 fallback 路径
+
+# VLM 配置（旧版 OmniGenV2_TAC_*.py 等脚本）
 --use_local_model_weight         # 使用本地模型权重
---local_model_weight_path Qwen3-VL-4B-Instruct  # 本地模型路径
 --qwen_4bit                      # 4-bit 量化
---openai_api_key <key>           # API Key（不用本地模型时）
+--openai_api_key <key>           # API Key
 --llm_model Qwen/Qwen3-VL-30B-A3B-Instruct  # API 模型名
 
 # 生成参数
@@ -212,7 +243,7 @@
 | 脚本 | 架构 | 说明 | 运行命令 |
 |------|------|------|----------|
 | `OmniGenV2_TAC_DINO_Importance_Aircraft.py` | TAC + DINO + VAR | **5步流水线**：非对称解析→双阶段检索→DINO注入生成→空间诊断→反思重生成 | `python OmniGenV2_TAC_DINO_Importance_Aircraft.py --device_id 0 --retrieval_method LongCLIP --enable_teacache --use_local_model_weight` |
-| `OmniGenV2_TAC_DINO_Importance_Aircraft_AR.py` | TAC + DINO + VAR (AR Fusion) | **5步流水线 (Early Fusion)**：使用 AR Early Fusion 引入图像 | `python OmniGenV2_TAC_DINO_Importance_Aircraft_AR.py --device_id 0 --retrieval_method LongCLIP --use_local_model_weight` |
+| `src/experiments/OmniGenV2_IPC_AR.py` | IPC-AR | **5步流水线**：重要性解析→双阶段检索→DINO注入生成→IPC身份诊断→基于IPC cues的LLM强化 | `python src/experiments/OmniGenV2_IPC_AR.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet` |
 
 **5 步流水线架构**：
 
@@ -234,7 +265,37 @@
 | `--tac_pass_threshold` | 6.0 | TAC 通过分数 (Tier A) |
 | `--tac_early_stop_threshold` | 8.0 | TAC 早停分数 (优秀) |
 | `--use_sam2_matting` | False | 启用 SAM2 进行背景隔离，提取纯净主体防止背景污染 |
-| `--decouple_threshold` | 0.25 | DINO 潜空间衰减倒计时，避免颜色/风格崩坏 (0.0=关闭) |
+| `--decouple_threshold` | 0.25 | 参考图引导覆盖的推理步比例：`0.0`=全程无参考图，`1.0`=全程参考图，`0.65`=前 65% 步有参考引导（推荐）。注意：旧文档中"0.0=关闭"的描述有误，已修正 |
+
+### IPC-AR 独立主实验
+
+`src/experiments/OmniGenV2_IPC_AR.py` 是当前论文主线使用的独立实现，不再依附其他 experiment 文件。其闭环结构如下：
+
+| 步骤 | 名称 | 功能 |
+|------|------|------|
+| Step 1 | Importance-aware Input Interpreter | 从 prompt 中提取高重要度实体与辅助属性，服务检索与后续修正 |
+| Step 2 | Dual-Stage Retrieval | 使用 LongCLIP 召回候选参考图，再由 VLM 进行 identity-aware rerank |
+| Step 3 | DINO-Injected Generation | 将 DINOv3 结构先验注入 OmniGen2 生成过程 |
+| Step 4 | IPC Identity Diagnosis | 判断生成图与目标细粒度实体是否一致，并输出 mismatch cues |
+| Step 5 | IPC-driven LLM Reinforcement | 将 mismatch cues 反馈给文本 LLM，生成修正 prompt 继续重试 |
+
+推荐运行命令：
+
+```bash
+python src/experiments/OmniGenV2_IPC_AR.py \
+    --device_id 0 \
+    --task_index 0 \
+    --total_chunks 1 \
+    --omnigen2_path ./OmniGen2 \
+    --retrieval_method LongCLIP \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_API_KEY \
+    --vl_api_key YOUR_API_KEY \
+    --decouple_threshold 0.65 \
+    --max_retries 2
+```
+
+> `--text_api_key` 与 `--vl_api_key` 可使用同一个 Key（SiliconFlow）。不传 `--vl_api_key` 时 Step2 VAR rerank 和 Step4 IPC 诊断会 fallback 到本地 `Qwen3-VL-4B-Instruct`，功能可用但与使用 API 的实验结果不可直接横向对比。
 
 ### OmniGenV2 消融实验 (Ablation)
 
@@ -248,6 +309,33 @@
 | `OmniGenV2_Ablation_noTAC*.py` | 无 TAC 分层诊断 | 使用基础 VLM 评分，缺乏细致的局部/全局错误分类及重试 |
 
 *注意：每种消融实验均包含普通版和对应的 `_AR` (Autoregressive Early Fusion) 版本。*
+
+### IPC-AR 论文消融
+
+主表建议使用以下 4 组：
+
+| 脚本 | 消融项 | 说明 | 运行命令 |
+|------|--------|------|----------|
+| `src/experiments/OmniGenV2_IPC_AR.py` | 无 | 完整 IPC-AR 主实验 | `python src/experiments/OmniGenV2_IPC_AR.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+| `src/experiments/OmniGenV2_IPC_AR_Ablation_noStage2Rerank.py` | w/o Stage-2 Rerank | 不再执行 VLM rerank，直接使用 Stage-1 top-1 检索结果 | `python src/experiments/OmniGenV2_IPC_AR_Ablation_noStage2Rerank.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+| `src/experiments/OmniGenV2_IPC_AR_Ablation_noDINOInject.py` | w/o DINOInject | 关闭 DINO 结构先验注入，只保留检索与语义修正闭环 | `python src/experiments/OmniGenV2_IPC_AR_Ablation_noDINOInject.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+| `src/experiments/OmniGenV2_IPC_AR_Ablation_noLLMReinforce.py` | w/o LLMReinforce | 不使用 mismatch cues 驱动的文本强化，仅执行单轮 IPC 诊断 | `python src/experiments/OmniGenV2_IPC_AR_Ablation_noLLMReinforce.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+
+补充材料建议使用以下 2 组：
+
+| 脚本 | 消融项 | 说明 | 运行命令 |
+|------|--------|------|----------|
+| `src/experiments/OmniGenV2_IPC_AR_Ablation_noIPCCues.py` | w/o IPCCues | 保留 LLM 强化阶段，但不向其注入 IPC mismatch cues | `python src/experiments/OmniGenV2_IPC_AR_Ablation_noIPCCues.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+| `src/experiments/OmniGenV2_IPC_AR_Ablation_noAdaptiveLambda.py` | w/o Adaptive Lambda | DINO λ 固定为初始值，不随失败重试逐步增强 | `python src/experiments/OmniGenV2_IPC_AR_Ablation_noAdaptiveLambda.py --device_id 0 --task_index 0 --total_chunks 1 --omnigen2_path ./OmniGen2 --retrieval_method LongCLIP --retrieval_datasets aircraft cub imagenet --text_api_key YOUR_KEY --vl_api_key YOUR_KEY --decouple_threshold 0.65 --max_retries 2` |
+
+如果需要多卡并行，可以仅修改以下参数，不改变其余实验设定：
+
+```bash
+--device_id 0 --task_index 0 --total_chunks 4
+--device_id 1 --task_index 1 --total_chunks 4
+--device_id 2 --task_index 2 --total_chunks 4
+--device_id 3 --task_index 3 --total_chunks 4
+```
 
 ---
 

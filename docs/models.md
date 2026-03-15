@@ -335,23 +335,41 @@ model, preprocess = longclip.load("Long-CLIP/checkpoints/longclip-L.pt", device=
 | 项目 | 详情 |
 |------|------|
 | **SigLIP 版本** | `google/siglip-so400m-patch14-384` |
-| **SigLIP2 版本** | `google/siglip2-base-patch16-224` |
 | **类型** | Sigmoid Loss 预训练的视觉-语言模型 |
 | **加载方式** | 通过 HuggingFace `transformers` 自动下载 |
 | **用途** | 图像-文本检索、评估指标 |
+
+**SigLIP2 模型族**（注意维度不兼容，不可混用缓存）：
+
+| 模型 ID | 嵌入维度 | 对应数据集缓存 | 备注 |
+|---------|---------|--------------|------|
+| `google/siglip2-base-patch16-224` | 768d | aircraft | 旧缓存，`.pt` 文件无 `model_name` 元数据 |
+| `google/siglip2-so400m-patch16-naflex` | 1152d | cub、imagenet | `.pt` 文件含 `model_name` 元数据 |
+
+> **自动对齐**：`ImageRetriever` 会读取嵌入缓存中存储的 `model_name` 字段，在加载时自动热切换 SigLIP2 查询编码器至匹配的模型，无需手动指定 `--siglip2_model_id`。混合多数据集场景（aircraft + cub + imagenet）中每个子检索器独立对齐。
 
 #### 使用方式
 
 ```bash
 # 使用 SigLIP 检索
-python OmniGenV2_TAC_DINO_Importance_Aircraft.py --retrieval_method SigLIP
+python src/experiments/OmniGenV2_IPC_AR.py --retrieval_method SigLIP \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_KEY --vl_api_key YOUR_KEY
 
-# 使用 SigLIP2 检索
-python OmniGenV2_TAC_DINO_Importance_Aircraft.py --retrieval_method SigLIP2
+# 使用 SigLIP2 检索（自动对齐模型，无需手动指定 --siglip2_model_id）
+python src/experiments/OmniGenV2_IPC_AR.py --retrieval_method SigLIP2 \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_KEY --vl_api_key YOUR_KEY
+
+# 若需强制指定 SigLIP2 模型（比如重新预计算缓存时）
+python src/experiments/OmniGenV2_IPC_AR.py --retrieval_method SigLIP2 \
+    --siglip2_model_id google/siglip2-so400m-patch16-naflex \
+    --retrieval_datasets cub imagenet \
+    --text_api_key YOUR_KEY --vl_api_key YOUR_KEY
 ```
 
 ```python
-# 代码中使用 (static_retrieval.py / memory_guided_retrieval.py)
+# 代码中使用 (memory_guided_retrieval.py)
 from transformers import AutoModel, AutoProcessor
 
 model = AutoModel.from_pretrained("google/siglip-so400m-patch14-384")

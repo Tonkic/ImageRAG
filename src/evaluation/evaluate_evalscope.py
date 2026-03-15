@@ -35,6 +35,20 @@ def setup_tee_logging(log_filename):
         sys.stdout = TeeLogger(log_filename, sys.stdout)
         sys.stderr = TeeLogger(log_filename, sys.stderr)
 
+
+def count_generated_classes(path):
+    generated_classes = set()
+
+    for p in glob.glob(os.path.join(path, "*_FINAL.png")):
+        base = os.path.basename(p)
+        generated_classes.add(base.replace("_FINAL.png", ""))
+
+    for p in glob.glob(os.path.join(path, "*_V*.png")):
+        base = os.path.basename(p)
+        generated_classes.add(base.rsplit("_V", 1)[0])
+
+    return len(generated_classes)
+
 # Metric Descriptions (Higher is better unless noted)
 METRIC_INFO = {
     "CLIPScore": "Measures image-text alignment using CLIP ViT-L/14.",
@@ -78,30 +92,16 @@ except ImportError as e:
 def is_experiment_folder(path, allow_incomplete=False):
     if not os.path.isdir(path): return False
 
-    # Collect all unique class names generated in this folder
-    generated_classes = set()
+    generated_count = count_generated_classes(path)
 
-    # Check FINALs
-    for p in glob.glob(os.path.join(path, "*_FINAL.png")):
-        base = os.path.basename(p)
-        class_name = base.replace("_FINAL.png", "")
-        generated_classes.add(class_name)
-
-    # Check V versions
-    for p in glob.glob(os.path.join(path, "*_V*.png")):
-        base = os.path.basename(p)
-        # Extract class name before _V
-        class_name = base.rsplit("_V", 1)[0]
-        generated_classes.add(class_name)
-
-    if len(generated_classes) >= 100:
+    if generated_count >= 100:
         return True
-    elif len(generated_classes) > 0:
+    elif generated_count > 0:
         if allow_incomplete:
-            print(f"[Include] Experiment '{os.path.basename(path)}' only has {len(generated_classes)}/100 classes, but --allow_incomplete is set.")
+            print(f"[Include] Experiment '{os.path.basename(path)}' only has {generated_count}/100 classes, but --allow_incomplete is set.")
             return True
         else:
-            print(f"[Skip] Experiment '{os.path.basename(path)}' only has {len(generated_classes)}/100 classes. Evaluator will skip until 100 classes are completed.")
+            print(f"[Skip] Experiment '{os.path.basename(path)}' only has {generated_count}/100 classes. Evaluator will skip until 100 classes are completed.")
             return False
 
     return False
@@ -149,10 +149,11 @@ def load_metric_evaluator(metric_name):
              gc.collect()
         return None
 
-def run_single_metric(metric_name, root_dir, classes_txt, device_id, force_rerun=False, log_file=None):
+def run_single_metric(metric_name, root_dir, classes_txt, device_id,
+                      force_rerun=False, log_file=None, allow_incomplete=False):
     if log_file: setup_tee_logging(log_file)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-    experiments = discover_experiments(root_dir)
+    experiments = discover_experiments(root_dir, allow_incomplete)
 
     exps_to_process = []
     for exp_path in experiments:
@@ -257,11 +258,12 @@ class InceptionWrapper(torch.nn.Module):
         h.remove()
         return self.features, logits
 
-def run_fid_is_metric(root_dir, classes_txt, real_images_list, real_images_root, device_id, force_rerun=False, log_file=None):
+def run_fid_is_metric(root_dir, classes_txt, real_images_list, real_images_root, device_id,
+                      force_rerun=False, log_file=None, allow_incomplete=False):
     if log_file: setup_tee_logging(log_file)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    experiments = discover_experiments(root_dir)
+    experiments = discover_experiments(root_dir, allow_incomplete)
 
     exps_to_process = []
     for exp_path in experiments:
@@ -379,13 +381,15 @@ def run_fid_is_metric(root_dir, classes_txt, real_images_list, real_images_root,
     torch.cuda.empty_cache()
 
 
-def run_dino_metric(root_dir, classes_txt, real_images_list, real_images_root, repo_path, weights_path, device_id, force_rerun=False, log_file=None):
+def run_dino_metric(root_dir, classes_txt, real_images_list, real_images_root,
+                    repo_path, weights_path, device_id,
+                    force_rerun=False, log_file=None, allow_incomplete=False):
     if log_file: setup_tee_logging(log_file)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     import sys
 
-    experiments = discover_experiments(root_dir)
+    experiments = discover_experiments(root_dir, allow_incomplete)
     exps_to_process = []
     for exp_path in experiments:
         log_file = os.path.join(exp_path, "logs", "evalscope_metrics.json")
@@ -547,7 +551,7 @@ def main():
                 print("="*60)
                 p = multiprocessing.Process(
                     target=run_single_metric,
-                    args=(m_name, args.root_dir, args.classes_txt, args.device_id, args.force, log_filename)
+                    args=(m_name, args.root_dir, args.classes_txt, args.device_id, args.force, log_filename, args.allow_incomplete)
                 )
                 p.start()
                 while p.is_alive():
@@ -559,9 +563,9 @@ def main():
                 print(f" STARTING EVALUATION FOR: DINO v3 Score")
                 print("="*60)
                 p = multiprocessing.Process(
-                    target=run_dino_metric,
+                      target=run_dino_metric,
                     args=(args.root_dir, args.classes_txt, args.real_images_list, args.real_images_root,
-                          args.dinov3_repo_path, args.dinov3_weights_path, args.device_id, args.force, log_filename)
+                          args.dinov3_repo_path, args.dinov3_weights_path, args.device_id, args.force, log_filename, args.allow_incomplete)
                 )
                 p.start()
                 while p.is_alive():
@@ -573,9 +577,9 @@ def main():
                 print(f" STARTING EVALUATION FOR: FID & Inception Score")
                 print("="*60)
                 p = multiprocessing.Process(
-                    target=run_fid_is_metric,
+                      target=run_fid_is_metric,
                     args=(args.root_dir, args.classes_txt, args.real_images_list, args.real_images_root,
-                          args.device_id, args.force, log_filename)
+                          args.device_id, args.force, log_filename, args.allow_incomplete)
                 )
                 p.start()
                 while p.is_alive():
@@ -584,7 +588,7 @@ def main():
             print("\n[INFO] Skipping actual metrics evaluation (--update_config_only is ON).")
 
         print("\nEvaluation Complete.")
-        generate_summary_table(args.root_dir)
+        generate_summary_table(args.root_dir, args.allow_incomplete)
 
     except KeyboardInterrupt:
         print("\n[!] Ctrl+C detected. Terminating child processes...")
@@ -618,6 +622,11 @@ def extract_run_config(exp_path):
                     config_data["Retrieval_Datasets"] = val.replace("[", "").replace("]", "").replace("'", "")
                 elif line.startswith("llm_model:"):
                     config_data["LLM_Model"] = line.split(":", 1)[1].strip()
+                elif line.startswith("text_model:"):
+                    config_data["Text_Model"] = line.split(":", 1)[1].strip()
+                    config_data.setdefault("LLM_Model", config_data["Text_Model"])
+                elif line.startswith("vl_model:"):
+                    config_data["VL_Model"] = line.split(":", 1)[1].strip()
                 elif line.startswith("image_guidance_scale:"):
                     config_data["Image_Guidance"] = line.split(":", 1)[1].strip()
                 elif line.startswith("text_guidance_scale:"):
@@ -643,14 +652,19 @@ def extract_run_config(exp_path):
     return config_data
 
 
-def generate_summary_table(root_dir):
-    experiments = discover_experiments(root_dir)
+def generate_summary_table(root_dir, allow_incomplete=False):
+    experiments = discover_experiments(root_dir, allow_incomplete)
     results = {}
 
     for exp_path in experiments:
         exp_name = os.path.relpath(exp_path, root_dir)
         log_file = os.path.join(exp_path, "logs", "evalscope_metrics.json")
-        exp_results = {}
+        generated_count = count_generated_classes(exp_path)
+        exp_results = {
+            "Generated_Classes": generated_count,
+            "Expected_Classes": 100,
+            "Is_Complete": generated_count >= 100,
+        }
 
         # 1. Read Metrics
         if os.path.exists(log_file):
@@ -708,7 +722,8 @@ def generate_summary_table(root_dir):
         "Inception Score", "MPS", "PickScore", "VQAScore"
     ]
     config_order = [
-        "LLM_Model", "Retrieval_Method", "Retrieval_Datasets",
+        "Generated_Classes", "Expected_Classes", "Is_Complete",
+        "LLM_Model", "Text_Model", "VL_Model", "Retrieval_Method", "Retrieval_Datasets",
         "Image_Guidance", "Text_Guidance",
         "VAR_K", "DINO_L_Init", "DINO_L_Max",
         "TAC_Pass", "TAC_EarlyStop", "Resolution"

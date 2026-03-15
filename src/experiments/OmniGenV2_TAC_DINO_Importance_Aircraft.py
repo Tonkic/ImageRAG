@@ -59,6 +59,8 @@ import argparse
 import sys
 import os
 
+from _result_metadata import collect_run_metadata, write_run_metadata_block, write_run_metadata_json
+
 # Wait to import torch until CUDA is set
 
 # ==============================================================================
@@ -1395,6 +1397,8 @@ if __name__ == "__main__":
     os.makedirs(DATASET_CONFIG['output_path'], exist_ok=True)
     logs_dir = os.path.join(DATASET_CONFIG['output_path'], "logs")
     os.makedirs(logs_dir, exist_ok=True)
+    run_metadata = collect_run_metadata(__file__, args, result_dir=DATASET_CONFIG['output_path'], logs_dir=logs_dir)
+    write_run_metadata_json(logs_dir, run_metadata)
 
     # --- Resource Monitoring ---
     monitor = ResourceMonitor(interval=1.0)
@@ -1406,9 +1410,7 @@ if __name__ == "__main__":
         f.write("=" * 60 + "\n")
         f.write("Importance-Based 5-Step Pipeline Configuration\n")
         f.write("=" * 60 + "\n\n")
-        f.write("[Command Line Arguments]\n")
-        for arg in sorted(vars(args)):
-            f.write(f"  {arg}: {getattr(args, arg)}\n")
+        write_run_metadata_block(f, run_metadata)
         f.write(f"\n[Runtime Info]\n")
         f.write(f"  Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}\n")
@@ -1436,6 +1438,7 @@ if __name__ == "__main__":
         f_log.write(f"Class: {class_name} ({class_idx + 1}/{len(my_tasks)})\n")
         f_log.write(f"Prompt: {prompt}\n")
         f_log.write(f"{'=' * 60}\n\n")
+        write_run_metadata_block(f_log, run_metadata)
 
         try:
             # ==================================================================
@@ -1670,6 +1673,9 @@ if __name__ == "__main__":
             summary = {
                 "class_name": class_name,
                 "prompt": prompt,
+                "script_name": run_metadata["script_name"],
+                "script_path": run_metadata["script_path"],
+                "command_redacted": run_metadata["command_redacted"],
                 "retrieval_query": retrieval_query,
                 "generation_prompt": generation_prompt[:500],
                 "importance_weights": weights,
@@ -1712,6 +1718,7 @@ if __name__ == "__main__":
         f.write("=" * 60 + "\n")
         f.write("Importance-Based 5-Step Pipeline — Run Summary\n")
         f.write("=" * 60 + "\n\n")
+        write_run_metadata_block(f, run_metadata)
         f.write(f"Total execution time: {elapsed:.2f}s ({elapsed / 60:.1f}min)\n")
         f.write(f"Classes processed: {len(my_tasks)}\n")
         f.write(f"Retrieval method: {args.retrieval_method}\n")

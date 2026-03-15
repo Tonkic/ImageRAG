@@ -82,6 +82,45 @@ python OmniGenV2_TAC_DINO_Importance_Aircraft.py \
     --omnigen2_path ./OmniGen2 \
     --retrieval_method LongCLIP \
     --use_local_model_weight
+
+# IPC-AR 主实验（推荐论文主线配置）
+python src/experiments/OmniGenV2_IPC_AR.py \
+    --device_id 0 \
+    --task_index 0 \
+    --total_chunks 1 \
+    --omnigen2_path ./OmniGen2 \
+    --retrieval_method LongCLIP \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_API_KEY \
+    --vl_api_key YOUR_API_KEY \
+    --decouple_threshold 0.65 \
+    --max_retries 2
+
+# IPC-AR 换用 SigLIP2 检索（自动对齐模型，无需额外参数）
+python src/experiments/OmniGenV2_IPC_AR.py \
+    --device_id 0 \
+    --task_index 0 \
+    --total_chunks 1 \
+    --omnigen2_path ./OmniGen2 \
+    --retrieval_method SigLIP2 \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_API_KEY \
+    --vl_api_key YOUR_API_KEY \
+    --decouple_threshold 0.65 \
+    --max_retries 2
+
+# IPC-AR 主表消融：w/o Stage-2 Rerank
+python src/experiments/OmniGenV2_IPC_AR_Ablation_noStage2Rerank.py \
+    --device_id 0 \
+    --task_index 0 \
+    --total_chunks 1 \
+    --omnigen2_path ./OmniGen2 \
+    --retrieval_method LongCLIP \
+    --retrieval_datasets aircraft cub imagenet \
+    --text_api_key YOUR_API_KEY \
+    --vl_api_key YOUR_API_KEY \
+    --decouple_threshold 0.65 \
+    --max_retries 2
 ```
 
 ## 整体管线流程
@@ -128,7 +167,7 @@ imageRAG/
 ├── results/                       # 实验结果输出
 ├── src/
 │   ├── experiments/
-│   │   └── OmniGenV2_TAC_*.py     # OmniGen2 核心融合与消融实验脚本
+│   │   └── OmniGenV2_*.py         # OmniGen2 核心融合与消融实验脚本
 │   ├── critical/
 │   │   ├── taxonomy_aware_critic.py           # TAC 主诊断与修复建议生成
 │   │   ├── fine_grained_alignment_critic.py   # 细粒度属性一致性评估
@@ -137,10 +176,12 @@ imageRAG/
 │   │   ├── overall_t2i_alignment_critic.py    # 整体文本-图像对齐评估
 │   │   ├── multi_axis_critic.py               # 多轴统一入口
 │   │   └── critic_common.py                   # Critic 公共工具
-│   └── retrieval/
-│       └── memory_guided_retrieval.py # (MGR) 混合检索逻辑
-├── rag_utils.py                   # 核心工具库与硬件映射工具
-├── custom_pipeline.py             # 自定义管线 (Early/Late Fusion, DINO Ingestion)
+│   ├── retrieval/
+│   │   └── memory_guided_retrieval.py # (MGR) 混合检索逻辑（含 SigLIP2 自动对齐）
+│   └── utils/
+│       ├── custom_pipeline.py         # 自定义管线 (DualPath / LateFusion / EarlyFusion)
+│       ├── rag_utils.py               # 核心工具库
+│       └── utils.py                   # 通用辅助工具
 ├── evaluate_*.py                  # 评估脚本 (EvalScope集成)
 ├── train_*.py                     # 训练脚本
 └── environment.yml                # Conda 环境配置

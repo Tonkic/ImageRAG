@@ -16,6 +16,7 @@ Behavior:
 
 Metrics Evaluated:
   - CLIP Score
+    - SigLIP2 Score
   - DINO v3 (Image Fidelity)
   - FID
   - Inception Score
@@ -35,6 +36,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 import open_clip
+from transformers import AutoModel, AutoProcessor
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from sklearn.covariance import LedoitWolf
@@ -73,10 +75,18 @@ parser.add_argument("--device_id", type=str, default="0")
 parser.add_argument("--root_dir", type=str, default="/home/tingyu/imageRAG/results")
 # Use Aircraft dataset config by default as requested context seems to imply
 parser.add_argument("--classes_txt", type=str, default="datasets/fgvc-aircraft-2013b/data/variants.txt")
+parser.add_argument("--metrics", type=str, default="all", help="Comma-sep list or 'all'")
 parser.add_argument("--real_images_list", type=str, default="datasets/fgvc-aircraft-2013b/data/images_variant_test.txt")
 parser.add_argument("--real_images_root", type=str, default="datasets/fgvc-aircraft-2013b/data/images")
 parser.add_argument("--dinov3_repo_path", type=str, default="/home/tingyu/imageRAG/dinov3")
 parser.add_argument("--dinov3_weights_path", type=str, default="/home/tingyu/imageRAG/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
+parser.add_argument("--siglip2_model_id", type=str, default=os.environ.get("SIGLIP2_MODEL_ID", "google/siglip2-so400m-patch16-naflex"))
+parser.add_argument("--siglip2_dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
+parser.add_argument("--siglip2_attn_implementation", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"])
+parser.add_argument("--siglip2_max_num_patches", type=int, default=None)
+parser.add_argument("--siglip2_local_files_only", action="store_true")
+parser.add_argument("--force", action="store_true", help="Force re-evaluation even if cached")
+parser.add_argument("--allow_incomplete", action="store_true", help="Evaluate experiments even if they have < 100 classes")
 
 args = parser.parse_args()
 
@@ -94,24 +104,75 @@ else:
 print(f"Using Extractors on: {ex_device}")
 print(f"Using Metrics on: {met_device}")
 
+
+def _resolve_siglip2_dtype(dtype_name):
+    return {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[dtype_name]
+
+
+def _parse_metrics_arg(metrics_arg):
+    alias_map = {
+        "clipscore": "clip",
+        "clip": "clip",
+        "siglip2 score": "siglip2",
+        "siglip2": "siglip2",
+        "dino v3 score": "dino_v3",
+        "dino": "dino_v3",
+        "dino_v3": "dino_v3",
+        "fid score": "fid",
+        "fid": "fid",
+        "inception score": "inception_score",
+        "inception": "inception_score",
+        "is": "inception_score",
+    }
+    tokens = [t.strip().lower() for t in metrics_arg.split(",") if t.strip()]
+    if not tokens or "all" in tokens:
+        return {"all"}
+    out = set()
+    for tok in tokens:
+        out.add(alias_map.get(tok, tok))
+    return out
+
+
+REQUESTED_METRICS = _parse_metrics_arg(args.metrics)
+
 # --------------------------------------------------
 # --- 2. Utils & Discovery ---
 # --------------------------------------------------
 
-def is_experiment_folder(path):
-    # Heuristic: Contains generated images?
-    # Look for *_FINAL.png or *_V1.png
-    if not os.path.isdir(path): return False
+def count_generated_classes(path):
+    generated_classes = set()
 
-    has_final = len(glob.glob(os.path.join(path, "*_FINAL.png"))) > 0
-    has_ver = len(glob.glob(os.path.join(path, "*_V1.png"))) > 0
+    for p in glob.glob(os.path.join(path, "*_FINAL.png")):
+        base = os.path.basename(p)
+        generated_classes.add(base.replace("_FINAL.png", ""))
 
-    return has_final or has_ver
+    for p in glob.glob(os.path.join(path, "*_V*.png")):
+        base = os.path.basename(p)
+        generated_classes.add(base.rsplit("_V", 1)[0])
 
-def discover_experiments(root):
+    return len(generated_classes)
+
+
+def is_experiment_folder(path, allow_incomplete=False):
+    if not os.path.isdir(path):
+        return False
+
+    generated_count = count_generated_classes(path)
+    if generated_count >= 100:
+        return True
+    if generated_count > 0 and allow_incomplete:
+        return True
+    return False
+
+
+def discover_experiments(root, allow_incomplete=False):
     experiments = []
     for root_path, dirs, files in os.walk(root):
-        if is_experiment_folder(root_path):
+        if is_experiment_folder(root_path, allow_incomplete):
             experiments.append(root_path)
     return experiments
 
@@ -127,12 +188,61 @@ def parse_log_file(file_path):
                         try:
                             val = float(val)
                             if "CLIP" in key: metrics['clip'] = val
+                            elif "SigLIP2" in key: metrics['siglip2'] = val
                             elif "DINO v3" in key: metrics['dino_v3'] = val
+                            elif key == "Reference Fidelity": metrics['rf'] = val
+                            elif key == "CCMD": metrics['ccmd'] = val
+                            elif key == "SVCG": metrics['svcg'] = val
                             elif "FID" in key: metrics['fid'] = val
                             elif "IS" in key or "Inception" in key: metrics['inception_score'] = val
                         except: pass
         return metrics
     except: return None
+
+
+def save_metrics_log(log_file, exp_name, metrics):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, "w") as f:
+        f.write(f"Evaluation Metrics for {exp_name}\n")
+        f.write("=" * 50 + "\n")
+        if 'clip' in metrics:
+            f.write(f"CLIP Score: {metrics['clip']:.4f}\n")
+        if 'siglip2' in metrics:
+            f.write(f"SigLIP2 Score: {metrics['siglip2']:.4f}\n")
+        if 'dino_v3' in metrics:
+            f.write(f"DINO v3 Score: {metrics['dino_v3']:.4f}\n")
+        if 'rf' in metrics:
+            f.write(f"Reference Fidelity: {metrics['rf']:.4f}\n")
+        if 'ccmd' in metrics:
+            f.write(f"CCMD: {metrics['ccmd']:.4f}\n")
+        if 'svcg' in metrics:
+            f.write(f"SVCG: {metrics['svcg']:.4f}\n")
+        if 'fid' in metrics:
+            f.write(f"FID Score: {metrics['fid']:.4f}\n")
+        if 'inception_score' in metrics:
+            f.write(f"Inception Score: {metrics['inception_score']:.4f}\n")
+
+
+def _unwrap_siglip2_features(features, modality="image"):
+    if isinstance(features, torch.Tensor):
+        return features
+
+    preferred = [f"{modality}_embeds", "pooler_output", "image_embeds", "text_embeds", "last_hidden_state"]
+    for attr in preferred:
+        value = getattr(features, attr, None)
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 3:
+                return value[:, 0, :]
+            return value
+
+    if isinstance(features, (tuple, list)) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor):
+            if first.dim() == 3:
+                return first[:, 0, :]
+            return first
+
+    raise TypeError(f"Unsupported SigLIP2 feature output type: {type(features)}")
 
 # --------------------------------------------------
 # --- 3. Dataset & Task Logic ---
@@ -231,6 +341,24 @@ def load_models(device, met_device=None):
     models['clip_model'], _, models['clip_preprocess'] = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
     models['clip_model'] = models['clip_model'].eval().to(device)
     models['clip_tokenizer'] = open_clip.get_tokenizer("ViT-B-32")
+
+    # 4. SigLIP2
+    print(f"Loading SigLIP2 ({args.siglip2_model_id})...")
+    try:
+        models['siglip2_model'] = AutoModel.from_pretrained(
+            args.siglip2_model_id,
+            dtype=_resolve_siglip2_dtype(args.siglip2_dtype),
+            attn_implementation=args.siglip2_attn_implementation,
+            local_files_only=args.siglip2_local_files_only,
+        ).to(device).eval()
+        models['siglip2_processor'] = AutoProcessor.from_pretrained(
+            args.siglip2_model_id,
+            local_files_only=args.siglip2_local_files_only,
+        )
+    except Exception as e:
+        print(f"Warning: SigLIP2 load failed. Continue without SigLIP2 metric. Error: {e}")
+        models['siglip2_model'] = None
+        models['siglip2_processor'] = None
 
     print("Load InceptionV3 (Wrapped) for Manual FID/IS...")
     models['inception_transform'] = T.Compose([
@@ -433,6 +561,16 @@ def evaluate_single(img_path, class_name, real_feats_map, txt_feats, models, dev
             c_feat /= c_feat.norm(dim=-1, keepdim=True)
             scores['clip'] = (c_feat @ txt_feats['clip'].T).item()
 
+            # SigLIP2
+            if models.get('siglip2_model') is not None and txt_feats.get('siglip2') is not None:
+                proc_kwargs = {"images": [img], "return_tensors": "pt"}
+                if args.siglip2_max_num_patches is not None:
+                    proc_kwargs["max_num_patches"] = args.siglip2_max_num_patches
+                s_inputs = models['siglip2_processor'](**proc_kwargs).to(device)
+                s_feat = _unwrap_siglip2_features(models['siglip2_model'].get_image_features(**s_inputs), modality="image")
+                s_feat = F.normalize(s_feat, dim=-1)
+                scores['siglip2'] = (s_feat @ txt_feats['siglip2'].T).item()
+
             # --- New Metrics ---
 
             # 1. CCMD (Class-Conditional Mahalanobis Distance)
@@ -499,10 +637,83 @@ def evaluate_single(img_path, class_name, real_feats_map, txt_feats, models, dev
 # --- main ---
 # --------------------------------------------------
 def main():
+    def run_siglip2_only(experiments):
+        print("Running SigLIP2-only evaluation mode...")
+        tasks = load_aircraft_tasks()
+
+        print(f"Loading SigLIP2 model: {args.siglip2_model_id}")
+        try:
+            model = AutoModel.from_pretrained(
+                args.siglip2_model_id,
+                dtype=_resolve_siglip2_dtype(args.siglip2_dtype),
+                attn_implementation=args.siglip2_attn_implementation,
+                local_files_only=args.siglip2_local_files_only,
+            ).to(ex_device).eval()
+            processor = AutoProcessor.from_pretrained(
+                args.siglip2_model_id,
+                local_files_only=args.siglip2_local_files_only,
+            )
+        except Exception as e:
+            print(f"[SigLIP2] Failed to load model: {e}")
+            return
+
+        final_results = {}
+        for exp_path in tqdm(experiments, desc="SigLIP2 experiments"):
+            exp_name = os.path.relpath(exp_path, args.root_dir)
+            log_file = os.path.join(exp_path, "logs", "evaluation_metrics.txt")
+            existing = parse_log_file(log_file) if os.path.exists(log_file) else {}
+
+            if not args.force and existing and 'siglip2' in existing:
+                final_results[exp_name] = existing
+                continue
+
+            scores = []
+            with torch.no_grad():
+                for task in tasks:
+                    img_path = get_best_image_path(exp_path, task['safe_filename_prefix'])
+                    if not img_path:
+                        continue
+
+                    try:
+                        text_inputs = processor(text=[task["prompt"]], return_tensors="pt").to(ex_device)
+                        txt_feat = _unwrap_siglip2_features(model.get_text_features(**text_inputs), modality="text")
+                        txt_feat = F.normalize(txt_feat, dim=-1)
+
+                        img = Image.open(img_path).convert("RGB")
+                        proc_kwargs = {"images": [img], "return_tensors": "pt"}
+                        if args.siglip2_max_num_patches is not None:
+                            proc_kwargs["max_num_patches"] = args.siglip2_max_num_patches
+                        img_inputs = processor(**proc_kwargs).to(ex_device)
+                        img_feat = _unwrap_siglip2_features(model.get_image_features(**img_inputs), modality="image")
+                        img_feat = F.normalize(img_feat, dim=-1)
+
+                        score = float((img_feat @ txt_feat.T).item())
+                        scores.append(score)
+                    except Exception:
+                        continue
+
+            merged = dict(existing or {})
+            if scores:
+                merged['siglip2'] = float(np.mean(scores))
+            final_results[exp_name] = merged
+            save_metrics_log(log_file, exp_name, merged)
+
+        print("\n" + "=" * 90)
+        print(f"{'Experiment Name':<60} | {'SigLIP2':<10}")
+        print("-" * 90)
+        for name in sorted(final_results.keys()):
+            val = final_results[name].get('siglip2', float('nan'))
+            print(f"{name:<60} | {val:.4f}")
+        print("=" * 90)
+
     # 1. Discover Experiments
     print(f"Scanning for experiments in {args.root_dir}...")
-    all_experiments = discover_experiments(args.root_dir)
+    all_experiments = discover_experiments(args.root_dir, args.allow_incomplete)
     print(f"Found {len(all_experiments)} potential experiment folders.")
+
+    if REQUESTED_METRICS == {"siglip2"}:
+        run_siglip2_only(all_experiments)
+        return
 
     # 2. Check Cache
     final_results = {}
@@ -512,7 +723,7 @@ def main():
         exp_name = os.path.relpath(exp_path, args.root_dir)
         log_file = os.path.join(exp_path, "logs", "evaluation_metrics.txt")
 
-        if os.path.exists(log_file):
+        if (not args.force) and os.path.exists(log_file):
             metrics = parse_log_file(log_file)
             if metrics:
                 final_results[exp_name] = metrics
@@ -587,6 +798,15 @@ def main():
                 txt_feats['clip'] = models['clip_model'].encode_text(ctk)
                 txt_feats['clip'] /= txt_feats['clip'].norm(dim=-1, keepdim=True)
 
+                if models.get('siglip2_model') is not None and models.get('siglip2_processor') is not None:
+                    s_text_inputs = models['siglip2_processor'](text=[task["prompt"]], return_tensors="pt").to(ex_device)
+                    s_text_feat = _unwrap_siglip2_features(
+                        models['siglip2_model'].get_text_features(**s_text_inputs), modality="text"
+                    )
+                    txt_feats['siglip2'] = F.normalize(s_text_feat, dim=-1)
+                else:
+                    txt_feats['siglip2'] = None
+
             # Update Metrics (Real) for ALL active experiments
             # (Expensive? Reuse real features?)
             # KID/FID update needs features.
@@ -638,6 +858,7 @@ def main():
             # Result Aggregation
             m_res = {}
             m_res['clip'] = np.mean([x['clip'] for x in acc])
+            m_res['siglip2'] = np.mean([x.get('siglip2', 0.0) for x in acc])
             m_res['dino_v3'] = np.mean([x.get('dino_v3', 0) for x in acc])
             m_res['ccmd'] = np.mean([x.get('ccmd', 99.0) for x in acc])
             m_res['svcg'] = np.mean([x.get('svcg', 1.0) for x in acc]) # Default high gap
@@ -690,22 +911,13 @@ def main():
                 log_dir = os.path.join(exp_path, "logs")
                 os.makedirs(log_dir, exist_ok=True)
                 log_file = os.path.join(log_dir, "evaluation_metrics.txt")
-                with open(log_file, "w") as f:
-                    f.write(f"Evaluation Metrics for {exp_name}\n")
-                    f.write("="*50 + "\n")
-                    f.write(f"CLIP Score: {m_res['clip']:.4f}\n")
-                    f.write(f"DINO v3 Score: {m_res['dino_v3']:.4f}\n")
-                    f.write(f"Reference Fidelity: {m_res['rf']:.4f}\n")
-                    f.write(f"CCMD: {m_res['ccmd']:.4f}\n")
-                    f.write(f"SVCG: {m_res['svcg']:.4f}\n")
-                    f.write(f"FID Score: {m_res['fid']:.4f}\n")
-                    f.write(f"Inception Score: {m_res['inception_score']:.4f}\n")
+                save_metrics_log(log_file, exp_name, m_res)
             except Exception as e:
                 print(f"Failed to save log for {exp_name}: {e}")
 
     # 4. Final Big Table
     print("\n" + "="*150)
-    print(f"{'Experiment Name':<60} | {'CLIP':<8} | {'RF':<8} | {'CCMD':<8} | {'SVCG':<8} | {'FID':<8} | {'IS':<8}")
+    print(f"{'Experiment Name':<60} | {'CLIP':<8} | {'SigLIP2':<8} | {'RF':<8} | {'CCMD':<8} | {'SVCG':<8} | {'FID':<8} | {'IS':<8}")
     print("-" * 150)
 
     # Sort keys for readability
@@ -714,7 +926,7 @@ def main():
     for name in sorted_keys:
         res = final_results[name]
         try:
-            print(f"{name:<60} | {res.get('clip',0):.4f}   | {res.get('rf',0):.4f}   | {res.get('ccmd',0):.2f}   | {res.get('svcg',0):.4f}   | {res.get('fid',0):.2f}    | {res.get('inception_score',0):.2f}")
+            print(f"{name:<60} | {res.get('clip',0):.4f}   | {res.get('siglip2',0):.4f}   | {res.get('rf',0):.4f}   | {res.get('ccmd',0):.2f}   | {res.get('svcg',0):.4f}   | {res.get('fid',0):.2f}    | {res.get('inception_score',0):.2f}")
         except: pass
 
     print("="*150)

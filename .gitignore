@@ -19,8 +19,7 @@ FlagEmbedding/
 models/
 output/
 Qwen3-VL-4B-Instruct/
-FLUX.1-Kontext-dev/
-GLM-Image/
+
 
 # 大型数据集和文件
 datasets/
@@ -44,3 +43,13 @@ pic2word_mapper_*.pt
 # 代理
 .agents/
 .agent/
+
+# local secrets
+tests/.text_api_key
+tests/.api_key
+.text_api_key
+tests/.gpt_api_key
+
+# local model weights (not for git)
+FLUX.1-Kontext-dev/
+GLM-Image/

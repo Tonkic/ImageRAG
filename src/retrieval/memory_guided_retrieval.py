@@ -85,8 +85,7 @@ class HybridRetriever:
 GLOBAL_BM25_RETRIEVER = None
 
 # [Removed] Long-CLIP Imports / Pic2Word imports
-
-    # [Method retrieve_composed removed]
+# [Method retrieve_composed removed]
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'Long-CLIP')))
@@ -96,6 +95,32 @@ try:
 except ImportError:
     LONGCLIP_AVAILABLE = False
     print("Warning: Long-CLIP not found.")
+
+
+def get_siglip2_model_id():
+    return os.environ.get("SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224")
+
+
+def _unwrap_siglip2_features(features, modality="image"):
+    if isinstance(features, torch.Tensor):
+        return features
+
+    preferred = [f"{modality}_embeds", "pooler_output", "image_embeds", "text_embeds", "last_hidden_state"]
+    for attr in preferred:
+        value = getattr(features, attr, None)
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 3:
+                return value[:, 0, :]
+            return value
+
+    if isinstance(features, (tuple, list)) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor):
+            if first.dim() == 3:
+                return first[:, 0, :]
+            return first
+
+    raise TypeError(f"Unsupported SigLIP2 feature output type: {type(features)}")
 
 # -----------------------------------------------------------------------------
 # Memory-Guided Retrieval Module
@@ -324,11 +349,11 @@ def get_siglip_similarities(prompts, image_paths, embeddings_path="", bs=1024, k
 
 def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, k=50, device='cuda:0', save=False):
     """
-    SigLIP2 Retrieval (google/siglip2-base-patch16-224)
+    SigLIP2 Retrieval (configurable via SIGLIP2_MODEL_ID env var)
     """
     try:
         from transformers import AutoModel, AutoProcessor
-        model_name = "google/siglip2-base-patch16-224"
+        model_name = get_siglip2_model_id()
         # Use flash_attention_2 if available for efficiency, though not strictly required
         # The user doc mentions attn_implementation="flash_attention_2"
         model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa").to(device).eval()
@@ -352,7 +377,7 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
     all_paths = []
 
     with torch.no_grad():
-        text_features = model.get_text_features(**text_inputs)
+        text_features = _unwrap_siglip2_features(model.get_text_features(**text_inputs), modality="text")
         normalized_text_vectors = F.normalize(text_features, dim=-1)
 
         for bi in range(0, len(image_paths), bs):
@@ -384,7 +409,7 @@ def get_siglip2_similarities(prompts, image_paths, embeddings_path="", bs=1024, 
 
                 # Process Images
                 image_inputs = processor(images=images, return_tensors="pt").to(device)
-                image_features = model.get_image_features(**image_inputs)
+                image_features = _unwrap_siglip2_features(model.get_image_features(**image_inputs), modality="image")
                 normalized_im_vectors = F.normalize(image_features, dim=-1)
                 final_bi_paths = valid_paths
 
@@ -949,6 +974,8 @@ class ImageRetriever:
         self.global_memory = global_memory
         self.image_paths = image_paths
         self.embeddings_path = embeddings_path
+        self.siglip2_model_name = None
+        self.embedding_model_name = None
 
         # Model & Processor
         self.model = None
@@ -963,6 +990,7 @@ class ImageRetriever:
         # Performance: Preload everything
         self._load_model(external_model, external_processor, adapter_path)
         self._load_database()
+        self._align_siglip2_model_to_embeddings()
 
         # Hybrid Setup
         self.bm25_retriever = None
@@ -974,7 +1002,11 @@ class ImageRetriever:
         global GLOBAL_RETRIEVAL_MODELS, GLOBAL_RETRIEVAL_PREPROCESSORS
 
         # Build unique cache key
-        cache_key = f"{self.method}_{self.device}"
+        if self.method == "SigLIP2":
+            requested_model_name = get_siglip2_model_id()
+            cache_key = f"{self.method}_{requested_model_name}_{self.device}"
+        else:
+            cache_key = f"{self.method}_{self.device}"
 
         # Core logic: If already loaded, borrow from memory!
         if cache_key in GLOBAL_RETRIEVAL_MODELS:
@@ -1020,11 +1052,8 @@ class ImageRetriever:
             self.preprocess = self.tokenizer   # Store tokenizer as preprocess for caching sake
 
         elif self.method == "SigLIP2":
-             from transformers import AutoModel, AutoProcessor
-             model_name = "google/siglip2-base-patch16-224"
-             self.model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa").to(self.device).eval()
-             self.processor = AutoProcessor.from_pretrained(model_name)
-             self.preprocess = self.processor   # Store processor as preprocess for caching sake
+            self._load_siglip2_model_by_name(requested_model_name)
+            return
 
         elif self.method in ["Qwen3-VL", "Qwen2.5-VL"]:
             # Use external if provided to save VRAM
@@ -1042,10 +1071,52 @@ class ImageRetriever:
         GLOBAL_RETRIEVAL_MODELS[cache_key] = self.model
         GLOBAL_RETRIEVAL_PREPROCESSORS[cache_key] = self.preprocess
 
+    def _load_siglip2_model_by_name(self, model_name):
+        global GLOBAL_RETRIEVAL_MODELS, GLOBAL_RETRIEVAL_PREPROCESSORS
+
+        cache_key = f"SigLIP2_{model_name}_{self.device}"
+        if cache_key in GLOBAL_RETRIEVAL_MODELS:
+            print(f"[ImageRetriever] ♻️ Using cached SigLIP2 model {model_name} on {self.device}.")
+            self.model = GLOBAL_RETRIEVAL_MODELS[cache_key]
+            self.preprocess = GLOBAL_RETRIEVAL_PREPROCESSORS[cache_key]
+            self.processor = self.preprocess
+            self.siglip2_model_name = model_name
+            return
+
+        from transformers import AutoModel, AutoProcessor
+
+        print(f"[ImageRetriever] Loading SigLIP2 model: {model_name}")
+        self.model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa").to(self.device).eval()
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.preprocess = self.processor
+        self.siglip2_model_name = model_name
+
+        GLOBAL_RETRIEVAL_MODELS[cache_key] = self.model
+        GLOBAL_RETRIEVAL_PREPROCESSORS[cache_key] = self.preprocess
+
+    def _align_siglip2_model_to_embeddings(self):
+        if self.method != "SigLIP2":
+            return
+
+        if not self.embedding_model_name:
+            return
+
+        if self.siglip2_model_name == self.embedding_model_name:
+            return
+
+        print(
+            "[ImageRetriever] SigLIP2 model/cache mismatch detected: "
+            f"query_model={self.siglip2_model_name}, cache_model={self.embedding_model_name}. "
+            "Switching query encoder to match cache model."
+        )
+        self._load_siglip2_model_by_name(self.embedding_model_name)
+
     def _load_database(self):
         print(f"[ImageRetriever] Loading Database Embeddings from {self.embeddings_path}...")
         all_tensors = []
         all_paths = []
+        expected_dim = None
+        siglip2_model_names = set()
 
         # Iterate all potential batch files
         # Heuristic: Check up to 1000 batches or until not found?
@@ -1091,11 +1162,46 @@ class ImageRetriever:
 
                     paths = data.get("paths", [])
 
+                    if self.method == "SigLIP2":
+                        model_name = data.get("model_name") or data.get("model_id")
+                        if isinstance(model_name, str) and model_name.strip():
+                            siglip2_model_names.add(model_name.strip())
+
                     if emb is not None and len(paths) > 0:
+                        if emb.dim() != 2:
+                            print(f"[ImageRetriever] Skip malformed embedding tensor in {cache_file}, shape={tuple(emb.shape)}")
+                            continue
+
+                        if expected_dim is None:
+                            expected_dim = emb.shape[1]
+                        elif emb.shape[1] != expected_dim:
+                            print(
+                                f"[ImageRetriever] Skip {cache_file} due to dim mismatch: "
+                                f"{emb.shape[1]} vs expected {expected_dim}"
+                            )
+                            continue
+
+                        if emb.shape[0] != len(paths):
+                            n = min(emb.shape[0], len(paths))
+                            print(
+                                f"[ImageRetriever] Path/embedding count mismatch in {cache_file}: "
+                                f"emb={emb.shape[0]} paths={len(paths)}. Truncating to {n}."
+                            )
+                            emb = emb[:n]
+                            paths = paths[:n]
+
                         all_tensors.append(emb) # Keep on CPU for concatenation
                         all_paths.extend(paths)
                 except Exception as e:
                     print(f"Error loading {cache_file}: {e}")
+
+        if self.method == "SigLIP2" and siglip2_model_names:
+            if len(siglip2_model_names) > 1:
+                print(
+                    "[ImageRetriever] WARNING: mixed SigLIP2 cache model names detected: "
+                    f"{sorted(siglip2_model_names)}. Using first one for query alignment."
+                )
+            self.embedding_model_name = sorted(siglip2_model_names)[0]
 
         if not all_tensors:
             print("WARNING: No embeddings loaded! Retrieval will fail.")
@@ -1123,6 +1229,25 @@ class ImageRetriever:
         # 1. Encode Queries
         query_embs = self._encode_text(queries) # [B, Dim]
 
+        if query_embs is None:
+            return [], []
+
+        if query_embs.shape[-1] != self.image_embeddings.shape[-1]:
+            raise RuntimeError(
+                "Retriever embedding dim mismatch: "
+                f"query_dim={query_embs.shape[-1]} vs db_dim={self.image_embeddings.shape[-1]}. "
+                f"method={self.method}, siglip2_query_model={self.siglip2_model_name}, "
+                f"siglip2_cache_model={self.embedding_model_name}."
+            )
+
+        if query_embs.dtype != self.image_embeddings.dtype:
+            if str(self.device).startswith("cpu"):
+                if self.image_embeddings.dtype != torch.float32:
+                    self.image_embeddings = self.image_embeddings.float()
+                query_embs = query_embs.float()
+            else:
+                query_embs = query_embs.to(self.image_embeddings.dtype)
+
         # 2. Dot Product
         # query_embs: [B, D], image_embeddings: [N, D] -> [B, N]
         sim_matrix = torch.matmul(query_embs, self.image_embeddings.T)
@@ -1147,7 +1272,7 @@ class ImageRetriever:
 
         topk_val, topk_idx = torch.topk(sim_matrix, k=min(self.k * 2, len(self.valid_paths)), dim=1)
 
-        topk_val = topk_val.cpu().numpy()
+        topk_val = topk_val.float().cpu().numpy()
         topk_idx = topk_idx.cpu().numpy()
 
         results_paths = []
@@ -1194,7 +1319,7 @@ class ImageRetriever:
 
             elif self.method == "SigLIP2":
                 text_inputs = self.processor(text=queries, padding="max_length", max_length=64, return_tensors="pt").to(self.device)
-                feats = self.model.get_text_features(**text_inputs)
+                feats = _unwrap_siglip2_features(self.model.get_text_features(**text_inputs), modality="text")
                 return F.normalize(feats, dim=-1)
 
             elif self.method in ["Qwen3-VL", "Qwen2.5-VL"]:
